@@ -1,0 +1,2864 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hand Particle Sphere · Random Luxury Variants + Clone Chain</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000;
+    }
+    body {
+      font-family: Inter, Pretendard, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #stage { position: fixed; inset: 0; }
+    canvas { display: block; width: 100%; height: 100%; }
+
+    #status {
+      position: fixed;
+      left: 50%;
+      bottom: 28px;
+      transform: translateX(-50%);
+      color: rgba(255,255,255,.70);
+      font-size: 12px;
+      letter-spacing: .055em;
+      white-space: nowrap;
+      pointer-events: none;
+      transition: opacity .35s ease;
+    }
+    #status.hide { opacity: 0; }
+
+    #mode {
+      position: fixed;
+      left: 20px;
+      top: 20px;
+      padding: 9px 12px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 999px;
+      color: rgba(255,255,255,.70);
+      background: rgba(255,255,255,.045);
+      backdrop-filter: blur(10px);
+      font-size: 11px;
+      letter-spacing: .07em;
+      pointer-events: none;
+      opacity: .85;
+      transition: opacity .55s ease;
+    }
+
+    #mic-status {
+      position: fixed;
+      right: 20px;
+      top: 20px;
+      padding: 9px 12px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 999px;
+      color: rgba(255,255,255,.62);
+      background: rgba(255,255,255,.045);
+      backdrop-filter: blur(10px);
+      font-size: 11px;
+      letter-spacing: .065em;
+      pointer-events: none;
+      opacity: .85;
+      transition: opacity .55s ease;
+    }
+
+    #webcam {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      width: min(26vw, 220px);
+      aspect-ratio: 16 / 9;
+      object-fit: cover;
+      transform: scaleX(-1);
+      border-radius: 12px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .25s ease;
+      border: 1px solid rgba(255,255,255,.12);
+    }
+    #webcam.debug { opacity: .34; }
+
+    /* 박수로 완전히 사라진 뒤에는 UI까지 사라져 검은 화면만 남긴다. */
+    body.clap-black #mode,
+    body.clap-black #status,
+    body.clap-black #mic-status {
+      opacity: 0 !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="mode">NORMAL · 검지 포인팅으로 CLONE MODE</div>
+  <div id="status">카메라와 손 인식 모델을 불러오는 중...</div>
+  <div id="mic-status">MIC · 준비 중</div>
+  <video id="webcam" autoplay muted playsinline></video>
+
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js";
+    import {
+      HandLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs";
+
+    // ============================================================
+    // 1. 튜닝 값
+    // ============================================================
+    const PARTICLE_COUNT = 2700;
+    const CONNECTOR_COUNT = 1800;
+    const MAX_SPHERES = 9;
+    const DETECTION_INTERVAL_MS = 40; // 약 25fps 손 추적
+
+    // 기존 손 펼침 정도에 따른 구 크기
+    const OPENNESS_MIN = 0.86;
+    const OPENNESS_MAX = 1.58;
+
+    // 포인팅이 이 시간 이상 안정적으로 유지되면 clone mode 활성화
+    const POINT_TRIGGER_MS = 180;
+
+    // 검지 까딱임(flick) 판정.
+    // straightness뿐 아니라 PIP/DIP 관절 각도도 함께 사용해
+    // 카메라 각도나 손 크기에 따라 bend가 누락되는 문제를 줄인다.
+    const FLICK_ARM_STRAIGHTNESS = 0.89;
+    const FLICK_BEND_STRAIGHTNESS = 0.88;
+    const FLICK_ARM_ANGLE_DEG = 158;
+    const FLICK_BEND_ANGLE_DEG = 148;
+    const FLICK_REARM_MS = 170;
+
+    // 복제 구체가 원본에서 빠져나오는 느낌
+    const FOLLOWER_FULL_DISTANCE = 1.35;
+    const FOLLOWER_RADIUS = 0.92;
+    const LOCK_MIN_DISTANCE = 0.14;
+
+    // 포인팅을 실제로 해제했을 때 clone mode 종료.
+    // flick 중 검지가 잠깐 접히는 동작은 종료로 보지 않도록 별도 grace time을 둔다.
+    // clone mode 종료는 "확실한 손바닥 펼침"만 받는다.
+    // 검지 굽힘/트래킹 흔들림만으로 복제 구체가 갑자기 사라지지 않게 grace time을 늘렸다.
+    const POINT_RELEASE_MS = 760;
+    const HAND_LOST_EXIT_MS = 1800;
+
+    // 손 회전 감도 — 손을 펴든 쥐든 계속 동작
+    const ROTATION_GAIN_X = 0.95;
+    const ROTATION_GAIN_Y = 0.95;
+    const ROTATION_GAIN_Z = 1.45;
+    const MAX_ROTATION_DELTA = Math.PI * 0.78;
+
+    // 손을 좌우로 '살짝' 흔들어도 FAST CHARGE MODE가 켜지도록 조율한다.
+    // 큰 액션보다 짧고 부드러운 lateral sway를 더 빠르게 받아들이는 편이
+    // 전체 무드상 훨씬 럭셔리하게 느껴지므로 임계값을 낮추고 반응성을 높였다.
+    const SHAKE_MIN_SPEED = 2.8;
+    const SHAKE_DIRECTION_WINDOW_MS = 320;
+    const SHAKE_ENERGY_DECAY_PER_SEC = 0.92;
+    const SHAKE_DIRECTION_BOOST = 1.14;
+    const SHAKE_CONTINUOUS_BOOST = 0.26;
+    const FAST_CHARGE_ENTER_LEVEL = 0.26;
+    const FAST_CHARGE_EXIT_LEVEL = 0.12;
+    const FAST_CHARGE_SHRINK = 0.64;
+    const FAST_CHARGE_DENSITY_SCALE = 0.20;
+    const FAST_CHARGE_SPIN_SPEED = 15.5;
+
+    // 양손 엄지+검지 pinch 후 좌우로 늘리면 구체가 2개로 분열된다.
+    const PINCH_DISTANCE_RATIO = 0.66;
+    const SPLIT_ATTACH_DISTANCE = 1.20;
+    const SPLIT_MIN_EXTRA_SPAN = 0.05;
+    const SPLIT_MAX_EXTRA_SPAN = 0.95;
+    const SPLIT_MAX_OFFSET = 1.05;
+    const SPLIT_SMALL_RADIUS = 0.46;
+
+    // 박수(clap) 판정 — 손 모양이 아니라 마이크의 짧고 강한 broadband impulse를 감지한다.
+    // 주변 소음에 맞춰 noise floor를 자동 추적하고, 큰 소리 + 빠른 onset + 고주파 성분을 함께 본다.
+    const CLAP_COOLDOWN_MS = 1050;
+    const CLAP_MIN_RMS = 0.078;          // 절대 최소 음량
+    const CLAP_NOISE_MULTIPLIER = 4.8;   // 평소 주변소음 대비 몇 배 큰지
+    const CLAP_MIN_PEAK = 0.40;          // 순간 peak
+    const CLAP_MIN_ONSET = 0.034;        // 직전 frame 대비 갑작스러운 상승량
+    const CLAP_MIN_CREST = 2.35;         // peak / RMS — 짧고 날카로운 소리 필터
+    const CLAP_MIN_HIGH_RATIO = 0.22;    // 1.8kHz 이상 에너지 비율
+    const CLAP_NOISE_ADAPT = 0.018;      // noise floor 적응 속도
+    // 한 프레임의 큰 소리만으로 박수 처리하지 않고, 바로 뒤의 빠른 감쇠까지 확인한다.
+    const CLAP_CONFIRM_MIN_MS = 28;
+    const CLAP_CONFIRM_MAX_MS = 210;
+    const CLAP_DECAY_RATIO = 0.68;
+
+    // 구체 복제 완료음 — 짧은 클릭음이 아니라 낮고 중후한 벨 + 긴 잔향으로 설계.
+    // 볼륨은 MASTER_GAIN, 울림 길이는 REVERB_SECONDS를 조절하면 된다.
+    // 레퍼런스 영상의 맥북 부팅음처럼:
+    // - 날카로운 어택 없이 부드럽게 피어남
+    // - 저중역 중심의 넓은 코드
+    // - 긴 잔향과 아주 긴 페이드아웃
+    // 정확한 부팅음을 복제하지 않고 같은 "무드와 질감"으로 통일한다.
+    const CLONE_CHIME_MASTER_GAIN = 0.115;
+    const CLONE_CHIME_REVERB_SECONDS = 5.8;
+    const CLONE_CHIME_CLAP_GUARD_MS = 3000;
+
+    const AMBIENT_MASTER_GAIN = 0.082;
+    const AMBIENT_BLACK_GAIN = 0.0;
+    const AMBIENT_TRANSITION_GAIN = 0.034;
+    const CLAP_DISSOLVE_GUARD_MS = 3200;
+    const CLAP_RESTORE_GUARD_MS = 3200;
+
+    // 박수 해체/복원 속도. 값이 작을수록 더 천천히 진행된다.
+    const CLAP_DISSOLVE_EASE = 0.026;
+    const CLAP_RESTORE_EASE = 0.024;
+    const CLAP_SCATTER_DISTANCE = 2.35;
+
+    const stage = document.querySelector("#stage");
+    const video = document.querySelector("#webcam");
+    const statusEl = document.querySelector("#status");
+    const modeEl = document.querySelector("#mode");
+    const micStatusEl = document.querySelector("#mic-status");
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+
+    const camera = new THREE.PerspectiveCamera(
+      42,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      100
+    );
+    camera.position.set(0, 0, 6.4);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    stage.appendChild(renderer.domElement);
+
+    const clock = new THREE.Clock();
+
+    // ============================================================
+    // 2. 유틸
+    // ============================================================
+    const clamp01 = (v) => Math.min(1, Math.max(0, v));
+    const lerp = (a, b, t) => a + (b - a) * t;
+    const map01 = (v, min, max) => clamp01((v - min) / (max - min));
+    const smoothstep = (a, b, x) => {
+      const t = clamp01((x - a) / (b - a));
+      return t * t * (3 - 2 * t);
+    };
+    const smootherstep = (a, b, x) => {
+      const t = clamp01((x - a) / (b - a));
+      return t * t * t * (t * (t * 6 - 15) + 10);
+    };
+    const dist3 = (a, b) => Math.hypot(
+      a.x - b.x,
+      a.y - b.y,
+      (a.z ?? 0) - (b.z ?? 0)
+    );
+
+    function makeParticleTexture() {
+      const c = document.createElement("canvas");
+      c.width = c.height = 64;
+      const ctx = c.getContext("2d");
+      const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+      g.addColorStop(0.00, "rgba(255,255,255,1)");
+      g.addColorStop(0.18, "rgba(255,255,255,.95)");
+      g.addColorStop(0.48, "rgba(255,255,255,.25)");
+      g.addColorStop(1.00, "rgba(255,255,255,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 64, 64);
+      return new THREE.CanvasTexture(c);
+    }
+
+    function makeCoreGlowTexture() {
+      const c = document.createElement("canvas");
+      c.width = c.height = 256;
+      const ctx = c.getContext("2d");
+      const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+      g.addColorStop(0.00, "rgba(255,255,255,1)");
+      g.addColorStop(0.10, "rgba(255,255,255,.92)");
+      g.addColorStop(0.28, "rgba(255,255,255,.44)");
+      g.addColorStop(0.56, "rgba(255,255,255,.12)");
+      g.addColorStop(1.00, "rgba(255,255,255,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, 256, 256);
+      return new THREE.CanvasTexture(c);
+    }
+
+    const particleTexture = makeParticleTexture();
+    const coreGlowTexture = makeCoreGlowTexture();
+
+    // ============================================================
+    // 박수 전역 비주얼 상태
+    // 0 = 정상 구체 / 1 = 완전히 해체되어 검은 화면
+    // ============================================================
+    let clapDissolve = 0;
+    let clapDissolveTarget = 0;
+    let clapBlack = false;
+    let clapCleanupPending = false;
+    let clapCleanupDone = false;
+
+    // ============================================================
+    // 3. 구체 스타일
+    //    레퍼런스 이미지의 12가지 구체를 1:1에 가깝게 WebGL 파티클로 재해석한다.
+    //    먼지형, 테두리 halo형, 와이어 네트워크형, 물결 라인형, 유체형, 연기형까지 모두 포함한다.
+    //    최초 접속 시에도 랜덤 스타일로 시작하고,
+    //    박수로 해체된 뒤 다시 복원될 때마다 다시 랜덤 스타일로 바뀐다.
+    // ============================================================
+    const SPHERE_STYLES = [
+      { id: "silverDust",   name: "SILVER DUST",   color: 0xe7edf2, bridgeColor: 0xdce5ed, pointScale: 1.02, opacity: 0.96, brightnessBoost: 1.12 },
+      { id: "amberHalo",    name: "AMBER HALO",    color: 0xd4a35c, bridgeColor: 0xd39d54, pointScale: 1.06, opacity: 0.95, brightnessBoost: 1.28 },
+      { id: "iceNetwork",   name: "ICE NETWORK",   color: 0x8fb5d8, bridgeColor: 0x89b1d8, pointScale: 1.10, opacity: 0.95, brightnessBoost: 1.42 },
+      { id: "violetDust",   name: "VIOLET DUST",   color: 0xbe72e6, bridgeColor: 0xbc77e4, pointScale: 1.04, opacity: 0.95, brightnessBoost: 1.22 },
+      { id: "flowLines",    name: "FLOW LINES",    color: 0xb9c7a8, bridgeColor: 0xb3c39e, pointScale: 1.18, opacity: 0.94, brightnessBoost: 1.50 },
+      { id: "deepBlue",     name: "DEEP BLUE",     color: 0x4b86d9, bridgeColor: 0x5b95e7, pointScale: 1.08, opacity: 0.95, brightnessBoost: 1.38 },
+      { id: "roseHalo",     name: "ROSE HALO",     color: 0xf08bb7, bridgeColor: 0xf28dbb, pointScale: 1.06, opacity: 0.95, brightnessBoost: 1.26 },
+      { id: "cyanCurrent",  name: "CYAN CURRENT",  color: 0x8fd9ec, bridgeColor: 0x8fe1ee, pointScale: 1.18, opacity: 0.94, brightnessBoost: 1.54 },
+      { id: "copperMesh",   name: "COPPER MESH",   color: 0xb9826c, bridgeColor: 0xc9927a, pointScale: 1.14, opacity: 0.94, brightnessBoost: 1.42 },
+      { id: "whiteCloud",   name: "WHITE CLOUD",   color: 0xf1f3f4, bridgeColor: 0xe6ebef, pointScale: 1.04, opacity: 0.97, brightnessBoost: 1.14 },
+      { id: "aurora",       name: "AURORA",        color: 0xffffff, bridgeColor: 0x9fe3dc, pointScale: 1.08, opacity: 0.96, brightnessBoost: 1.26 },
+      { id: "smokeVeil",    name: "SMOKE VEIL",    color: 0xbfc3c8, bridgeColor: 0xc7cdd3, pointScale: 1.16, opacity: 0.93, brightnessBoost: 1.62 }
+    ];
+
+    // 같은 타이밍에 존재하는 구체/브리지는 모두 동일한 스타일을 유지한다.
+    // 최초 접속 시에도 랜덤으로 시작하고,
+    // 박수로 복원될 때마다 이전과 다른 스타일을 랜덤으로 다시 고른다.
+    let currentSphereStyle = SPHERE_STYLES[0];
+
+    function pickRandomSphereStyle(excludeStyle = null) {
+      if (SPHERE_STYLES.length <= 1) return SPHERE_STYLES[0];
+      const pool = excludeStyle
+        ? SPHERE_STYLES.filter((style) => style.id !== excludeStyle.id)
+        : SPHERE_STYLES;
+      return pool[Math.floor(Math.random() * pool.length)];
+    }
+
+    currentSphereStyle = pickRandomSphereStyle();
+    console.info(`[Sphere] initial style: ${currentSphereStyle.name}`);
+
+    function randomUnitVector() {
+      const z = 1 - 2 * Math.random();
+      const theta = Math.random() * Math.PI * 2;
+      const r = Math.sqrt(Math.max(0, 1 - z * z));
+      return new THREE.Vector3(Math.cos(theta) * r, Math.sin(theta) * r, z);
+    }
+
+    function makeGreatCircleBasis() {
+      const normal = randomUnitVector();
+      const helper = Math.abs(normal.z) < 0.86
+        ? new THREE.Vector3(0, 0, 1)
+        : new THREE.Vector3(0, 1, 0);
+      const u = new THREE.Vector3().crossVectors(normal, helper).normalize();
+      const v = new THREE.Vector3().crossVectors(normal, u).normalize();
+      return { u, v };
+    }
+
+    function setRGB(array, i, color, gain = 1) {
+      const j = i * 3;
+      array[j] = color.r * gain;
+      array[j + 1] = color.g * gain;
+      array[j + 2] = color.b * gain;
+    }
+
+    function generateSphereStyleData(style) {
+      const base = new Float32Array(PARTICLE_COUNT * 3);
+      const flow = new Float32Array(PARTICLE_COUNT * 3);
+      const phase = new Float32Array(PARTICLE_COUNT);
+      const colors = new Float32Array(PARTICLE_COUNT * 3);
+      const baseColor = new THREE.Color(style.color);
+      const brightnessBoost = style.brightnessBoost ?? 1;
+
+      // 선/네트워크 스타일이 매번 완전히 다른 구조로 보이도록 작은 curve bank를 만든다.
+      const networkCircles = Array.from({ length: 34 }, makeGreatCircleBasis);
+      const meshCircles = Array.from({ length: 22 }, makeGreatCircleBasis);
+      const cyanBands = Array.from({ length: 30 }, (_, k) => ({
+        lat: -1.18 + (k / 29) * 2.36,
+        phase: Math.random() * Math.PI * 2,
+        freq: 1.3 + Math.random() * 2.5
+      }));
+      const smokeBands = Array.from({ length: 12 }, (_, k) => ({
+        lat: -1.05 + (k / 11) * 2.10,
+        phase: Math.random() * Math.PI * 2,
+        freq: 0.8 + Math.random() * 1.7
+      }));
+
+      const auroraA = new THREE.Color(0xe99178);
+      const auroraB = new THREE.Color(0xb16ac9);
+      const auroraC = new THREE.Color(0x6ed8d1);
+      const tempColor = new THREE.Color();
+
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        let x = 0, y = 0, z = 0;
+        let brightness = 1;
+        const theta = Math.random() * Math.PI * 2;
+        const j = i * 3;
+
+        if (style.id === "iceNetwork") {
+          // 여러 great-circle 위에 점을 놓아 레퍼런스의 얇은 네트워크/와이어 구체를 만든다.
+          const circle = networkCircles[i % networkCircles.length];
+          const a = theta + (i % 7) * 0.013;
+          const jitter = (Math.random() - 0.5) * 0.018;
+          x = (circle.u.x * Math.cos(a) + circle.v.x * Math.sin(a)) * (0.985 + jitter);
+          y = (circle.u.y * Math.cos(a) + circle.v.y * Math.sin(a)) * (0.985 + jitter);
+          z = (circle.u.z * Math.cos(a) + circle.v.z * Math.sin(a)) * (0.985 + jitter);
+          brightness = 0.72 + Math.random() * 0.56;
+        } else if (style.id === "flowLines") {
+          // 지문/섬유처럼 구 표면을 따라 흐르는 촘촘한 곡선 띠.
+          const bands = 52;
+          const band = i % bands;
+          const a = theta;
+          const baseLat = -1.30 + (band / (bands - 1)) * 2.60;
+          const lat = baseLat
+            + Math.sin(a * 1.45 + band * 0.37) * 0.075
+            + Math.sin(a * 3.1 - band * 0.19) * 0.025;
+          const rr = Math.cos(lat);
+          x = Math.cos(a) * rr;
+          y = Math.sin(lat);
+          z = Math.sin(a) * rr;
+          const twist = 0.34 * Math.sin(lat * 2.2);
+          const xx = x * Math.cos(twist) - z * Math.sin(twist);
+          const zz = x * Math.sin(twist) + z * Math.cos(twist);
+          x = xx; z = zz;
+          const shell = 0.972 + Math.random() * 0.024;
+          x *= shell; y *= shell; z *= shell;
+          brightness = 0.74 + Math.random() * 0.50;
+        } else if (style.id === "cyanCurrent") {
+          // 유체가 구 표면을 감아 흐르는 듯한 청록색 stream line.
+          const band = cyanBands[i % cyanBands.length];
+          const a = theta;
+          const lat = band.lat
+            + Math.sin(a * band.freq + band.phase) * 0.17
+            + Math.sin(a * 0.55 - band.phase) * 0.06;
+          const rr = Math.cos(lat);
+          x = Math.cos(a) * rr;
+          y = Math.sin(lat);
+          z = Math.sin(a) * rr;
+          const rot = 0.52 * Math.sin(a * 0.42 + band.phase);
+          const xx = x * Math.cos(rot) - y * Math.sin(rot);
+          const yy = x * Math.sin(rot) + y * Math.cos(rot);
+          x = xx; y = yy;
+          brightness = 0.62 + Math.random() * 0.56;
+        } else if (style.id === "copperMesh") {
+          // warm-toned low-poly mesh 느낌: 네트워크 선 + 드문 표면 점을 섞는다.
+          if (i < PARTICLE_COUNT * 0.74) {
+            const circle = meshCircles[i % meshCircles.length];
+            const a = theta;
+            x = circle.u.x * Math.cos(a) + circle.v.x * Math.sin(a);
+            y = circle.u.y * Math.cos(a) + circle.v.y * Math.sin(a);
+            z = circle.u.z * Math.cos(a) + circle.v.z * Math.sin(a);
+            const shell = 0.955 + Math.random() * 0.045;
+            x *= shell; y *= shell; z *= shell;
+          } else {
+            const dir = randomUnitVector();
+            const shell = 0.90 + Math.random() * 0.10;
+            x = dir.x * shell; y = dir.y * shell; z = dir.z * shell;
+          }
+          brightness = 0.58 + Math.random() * 0.62;
+        } else if (style.id === "smokeVeil") {
+          // 얇은 연무 리본이 서로 겹쳐 구의 실루엣만 은은하게 남는 타입.
+          const band = smokeBands[i % smokeBands.length];
+          const a = theta;
+          const lat = band.lat
+            + Math.sin(a * band.freq + band.phase) * 0.26
+            + Math.sin(a * 3.2 + band.phase * 0.6) * 0.08;
+          const rr = Math.cos(lat);
+          x = Math.cos(a) * rr;
+          y = Math.sin(lat);
+          z = Math.sin(a) * rr;
+          const shell = 0.91 + Math.random() * 0.09;
+          x *= shell; y *= shell; z *= shell;
+          brightness = 0.42 + Math.random() * 0.52;
+        } else {
+          // dust / halo / deep blue / rose / white / aurora 공통 shell.
+          const dir = randomUnitVector();
+          let shell = 0.90 + Math.random() * 0.14;
+          if (style.id === "whiteCloud") shell = 0.86 + Math.random() * 0.18;
+          x = dir.x * shell;
+          y = dir.y * shell;
+          z = dir.z * shell;
+
+          // 화면 가장자리에서 밝아지는 halo 계열.
+          if (style.id === "amberHalo" || style.id === "roseHalo") {
+            const rim = Math.pow(clamp01(Math.sqrt(x * x + y * y)), 6.5);
+            brightness = 0.38 + rim * 1.12 + Math.random() * 0.26;
+          } else if (style.id === "deepBlue") {
+            brightness = 0.54 + Math.random() * 0.60;
+          } else if (style.id === "silverDust") {
+            brightness = 0.72 + Math.random() * 0.56;
+          } else if (style.id === "whiteCloud") {
+            brightness = 0.62 + Math.random() * 0.56;
+          }
+        }
+
+        base[j] = x;
+        base[j + 1] = y;
+        base[j + 2] = z;
+
+        // 각 점의 자연스러운 해체/호흡 방향. 방사 방향 + 약한 난류를 섞는다.
+        let fx = x + (Math.random() * 2 - 1) * 0.42;
+        let fy = y + (Math.random() * 2 - 1) * 0.42;
+        let fz = z + (Math.random() * 2 - 1) * 0.42;
+        const fl = Math.hypot(fx, fy, fz) || 1;
+        flow[j] = fx / fl;
+        flow[j + 1] = fy / fl;
+        flow[j + 2] = fz / fl;
+        phase[i] = Math.random() * Math.PI * 2;
+
+        if (style.id === "aurora") {
+          // 아래/우측 cyan → 중앙 violet → 상단/좌측 warm amber의 고급 그라데이션.
+          const vertical = clamp01((y + 1) * 0.5);
+          const horizontal = clamp01((x + 1) * 0.5);
+          if (vertical < 0.50) {
+            tempColor.copy(auroraC).lerp(auroraB, vertical * 2);
+          } else {
+            tempColor.copy(auroraB).lerp(auroraA, (vertical - 0.5) * 2);
+          }
+          tempColor.lerp(auroraC, horizontal * 0.20);
+          setRGB(colors, i, tempColor, (0.72 + Math.random() * 0.50) * brightnessBoost);
+        } else {
+          setRGB(colors, i, baseColor, brightness * brightnessBoost);
+        }
+      }
+
+      return { base, flow, phase, colors };
+    }
+
+    let currentSphereStyleData = generateSphereStyleData(currentSphereStyle);
+    let sphereBase = currentSphereStyleData.base;
+    let sphereFlow = currentSphereStyleData.flow;
+    let spherePhase = currentSphereStyleData.phase;
+    let sphereColors = currentSphereStyleData.colors;
+    let frameDeltaSec = 1 / 60;
+
+    function getStyleMotionProfile(styleId) {
+      switch (styleId) {
+        case "iceNetwork": return { waveAmp: 0.010, flowMul: 0.34, shellBreath: 0.012 };
+        case "flowLines": return { waveAmp: 0.007, flowMul: 0.18, shellBreath: 0.008 };
+        case "cyanCurrent": return { waveAmp: 0.012, flowMul: 0.26, shellBreath: 0.010 };
+        case "copperMesh": return { waveAmp: 0.009, flowMul: 0.24, shellBreath: 0.008 };
+        case "smokeVeil": return { waveAmp: 0.018, flowMul: 0.28, shellBreath: 0.016 };
+        case "amberHalo":
+        case "roseHalo": return { waveAmp: 0.010, flowMul: 0.38, shellBreath: 0.010 };
+        case "whiteCloud": return { waveAmp: 0.014, flowMul: 0.45, shellBreath: 0.014 };
+        default: return { waveAmp: 0.012, flowMul: 0.40, shellBreath: 0.012 };
+      }
+    }
+
+    class ParticleSphere {
+      constructor(position = new THREE.Vector3(), radius = 1.02) {
+        this.geometry = new THREE.BufferGeometry();
+        this.positions = new Float32Array(PARTICLE_COUNT * 3);
+        this.positions.set(sphereBase);
+        this.positionAttribute = new THREE.BufferAttribute(this.positions, 3);
+        this.positionAttribute.setUsage(THREE.DynamicDrawUsage);
+        this.geometry.setAttribute("position", this.positionAttribute);
+        // 현재 페이지에서 랜덤 선택된 스타일의 per-particle color를 사용한다.
+        this.geometry.setAttribute("color", new THREE.BufferAttribute(sphereColors, 3));
+
+        this.material = new THREE.PointsMaterial({
+          color: 0xffffff,
+          vertexColors: true,
+          size: 0.046 * currentSphereStyle.pointScale,
+          map: particleTexture,
+          transparent: true,
+          opacity: currentSphereStyle.opacity,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          sizeAttenuation: true,
+          alphaTest: 0.02
+        });
+
+        this.points = new THREE.Points(this.geometry, this.material);
+        this.currentPos = position.clone();
+        this.targetPos = position.clone();
+        this.points.position.copy(position);
+
+        this.currentRadius = radius;
+        this.targetRadius = radius;
+        this.currentSpread = 0.075;
+        this.targetSpread = 0.075;
+        this.phaseOffset = Math.random() * Math.PI * 2;
+        this.targetQuaternion = new THREE.Quaternion();
+        this.smoothedQuaternion = new THREE.Quaternion();
+        this.displayQuaternion = new THREE.Quaternion();
+        this.spinQuaternion = new THREE.Quaternion();
+        this.spinEuler = new THREE.Euler(0, 0, 0, "XYZ");
+        this.chargeSpinAngle = Math.random() * Math.PI * 2;
+        this.locked = false;
+        // 잠긴 구체는 손 추적/후속 follower 생성과 무관하게 정확히 같은 위치에 남는다.
+        this.lockPosition = null;
+        this.lockQuaternion = new THREE.Quaternion();
+        this.emerging = false;
+        this.sourceSphere = null;
+        this.life = 1;
+        this.targetLife = 1;
+        this.dissolving = false;
+
+        scene.add(this.points);
+      }
+
+      applyStyleData(styleData, style, {
+        resetToBase = false,
+        seedScattered = false
+      } = {}) {
+        const colorAttr = this.geometry.getAttribute("color");
+        if (colorAttr && colorAttr.array.length === styleData.colors.length) {
+          colorAttr.array.set(styleData.colors);
+          colorAttr.needsUpdate = true;
+        } else {
+          this.geometry.setAttribute("color", new THREE.BufferAttribute(styleData.colors.slice(), 3));
+        }
+
+        this.material.size = 0.046 * style.pointScale;
+        this.material.opacity = style.opacity;
+
+        if (resetToBase) {
+          if (seedScattered) {
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+              const j = i * 3;
+              const scatterPhase = styleData.phase[i];
+              const tx = styleData.base[j];
+              const ty = styleData.base[j + 1];
+              const tz = styleData.base[j + 2];
+              const swirl = Math.sin(scatterPhase * 1.83) * 0.13;
+              this.positions[j] = tx + styleData.base[j] * 0.55 + styleData.flow[j] * CLAP_SCATTER_DISTANCE + styleData.flow[j + 1] * swirl;
+              this.positions[j + 1] = ty + styleData.base[j + 1] * 0.55 + styleData.flow[j + 1] * CLAP_SCATTER_DISTANCE - styleData.flow[j] * swirl;
+              this.positions[j + 2] = tz + styleData.base[j + 2] * 0.55 + styleData.flow[j + 2] * CLAP_SCATTER_DISTANCE;
+            }
+          } else {
+            this.positions.set(styleData.base);
+          }
+          this.positionAttribute.needsUpdate = true;
+        }
+      }
+
+      startDissolve(target = new THREE.Vector3()) {
+        this.dissolving = true;
+        this.targetPos.copy(target);
+        this.targetRadius = 0.12;
+        this.targetSpread = 1.15;
+      }
+
+      dispose() {
+        scene.remove(this.points);
+        this.geometry.dispose();
+        this.material.dispose();
+      }
+
+      update(t) {
+        if (this.locked && this.lockPosition) {
+          this.targetPos.copy(this.lockPosition);
+          this.targetQuaternion.copy(this.lockQuaternion);
+          this.targetLife = 1;
+          this.targetRadius = FOLLOWER_RADIUS;
+          this.targetSpread = 0.07;
+        }
+
+        const posEase = this.locked ? 0.30 : 0.13;
+        this.currentPos.lerp(this.targetPos, posEase);
+        this.currentRadius = lerp(this.currentRadius, this.targetRadius, this.dissolving ? 0.09 : 0.10);
+        this.currentSpread = lerp(this.currentSpread, this.targetSpread, this.dissolving ? 0.10 : 0.07);
+
+        this.points.position.copy(this.currentPos);
+        this.smoothedQuaternion.slerp(this.targetQuaternion, 0.16);
+
+        const chargeMix = (!this.locked && this === activeSphere && !this.dissolving)
+          ? fastChargeLevel
+          : 0;
+        this.chargeSpinAngle += FAST_CHARGE_SPIN_SPEED * chargeMix * frameDeltaSec;
+        this.spinEuler.set(
+          Math.sin(this.chargeSpinAngle * 0.45) * 0.18 * chargeMix,
+          this.chargeSpinAngle,
+          Math.cos(this.chargeSpinAngle * 0.32) * 0.12 * chargeMix,
+          "XYZ"
+        );
+        this.spinQuaternion.setFromEuler(this.spinEuler);
+        this.displayQuaternion.copy(this.smoothedQuaternion).multiply(this.spinQuaternion);
+        this.points.quaternion.copy(this.displayQuaternion);
+
+        if (this.dissolving) {
+          this.targetLife = 0;
+          this.life = lerp(this.life, this.targetLife, 0.065);
+        } else {
+          this.life = lerp(this.life, this.targetLife, 0.12);
+        }
+        // 박수 해체 중에는 먼저 점들이 바깥으로 퍼지고, 후반부에 서서히 빛이 사라진다.
+        const clapFade = 1 - smootherstep(0.34, 0.985, clapDissolve);
+        this.material.opacity = this.life * currentSphereStyle.opacity * clapFade * lerp(1, 1.16, chargeMix);
+
+        const motionProfile = getStyleMotionProfile(currentSphereStyle.id);
+        const breath = 1 + Math.sin(t * 1.20 + this.phaseOffset) * (0.022 + motionProfile.shellBreath);
+        const effectiveRadius = this.currentRadius * lerp(1, FAST_CHARGE_SHRINK, chargeMix);
+        const effectiveSpread = this.currentSpread * lerp(1, FAST_CHARGE_DENSITY_SCALE, chargeMix);
+        const p = this.positions;
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+          const j = i * 3;
+          const ph = spherePhase[i] + this.phaseOffset;
+          const waveA = Math.sin(t * 1.62 + ph);
+          const waveB = Math.sin(t * 0.83 + ph * 1.73);
+          const localRadius = effectiveRadius * breath * (1 + waveB * motionProfile.waveAmp);
+          const flow = effectiveSpread * motionProfile.flowMul * (0.45 + 0.55 * waveA);
+
+          let tx = sphereBase[j] * localRadius + sphereFlow[j] * flow;
+          let ty = sphereBase[j + 1] * localRadius + sphereFlow[j + 1] * flow;
+          let tz = sphereBase[j + 2] * localRadius + sphereFlow[j + 2] * flow;
+
+          if (this.dissolving) {
+            tx += sphereFlow[j] * 0.72;
+            ty += sphereFlow[j + 1] * 0.72;
+            tz += sphereFlow[j + 2] * 0.72;
+          }
+
+          // 박수 해체: 구 표면이 팽창하면서 각 파티클이 고유 방향으로 흩어진다.
+          // clapDissolve가 다시 0으로 가면 동일 경로를 역으로 따라 구체로 재조립된다.
+          const scatter = smootherstep(0.0, 1.0, clapDissolve);
+          const swirl = Math.sin(t * 0.55 + ph) * 0.13 * scatter;
+          tx += sphereBase[j] * (0.55 * scatter);
+          ty += sphereBase[j + 1] * (0.55 * scatter);
+          tz += sphereBase[j + 2] * (0.55 * scatter);
+          tx += sphereFlow[j] * CLAP_SCATTER_DISTANCE * scatter + sphereFlow[j + 1] * swirl;
+          ty += sphereFlow[j + 1] * CLAP_SCATTER_DISTANCE * scatter - sphereFlow[j] * swirl;
+          tz += sphereFlow[j + 2] * CLAP_SCATTER_DISTANCE * scatter;
+
+          p[j] += (tx - p[j]) * 0.078;
+          p[j + 1] += (ty - p[j + 1]) * 0.078;
+          p[j + 2] += (tz - p[j + 2]) * 0.078;
+        }
+
+        this.positionAttribute.needsUpdate = true;
+        this.material.size = lerp(0.058, 0.043, map01(this.currentRadius, 0.18, 1.15)) * currentSphereStyle.pointScale * lerp(1, 0.86, chargeMix);
+      }
+    }
+
+    function updateCoreGlowStyle() {
+      if (!coreGlowSprite) return;
+      coreGlowSprite.material.color.copy(getCoreGlowColor(currentSphereStyle));
+    }
+
+    function setCurrentSphereStyle(style, {
+      applyToBaseSphere = false,
+      seedScattered = false
+    } = {}) {
+      currentSphereStyle = style;
+      currentSphereStyleData = generateSphereStyleData(currentSphereStyle);
+      sphereBase = currentSphereStyleData.base;
+      sphereFlow = currentSphereStyleData.flow;
+      spherePhase = currentSphereStyleData.phase;
+      sphereColors = currentSphereStyleData.colors;
+      console.info(`[Sphere] active style: ${currentSphereStyle.name}`);
+      updateCoreGlowStyle();
+
+      if (applyToBaseSphere && typeof baseSphere !== "undefined" && baseSphere) {
+        baseSphere.applyStyleData(currentSphereStyleData, currentSphereStyle, {
+          resetToBase: true,
+          seedScattered
+        });
+      }
+      if (leftSplitSphere) leftSplitSphere.applyStyleData(currentSphereStyleData, currentSphereStyle, { resetToBase: false, seedScattered: false });
+      if (rightSplitSphere) rightSplitSphere.applyStyleData(currentSphereStyleData, currentSphereStyle, { resetToBase: false, seedScattered: false });
+    }
+
+    // ============================================================
+    // 4. 두 구체 사이의 유기적인 목/브리지
+    //    첨부 레퍼런스처럼 양 끝은 넓고 중앙은 좁은 입자 연결부
+    // ============================================================
+    class ParticleBridge {
+      constructor(aSphere, bSphere) {
+        this.aSphere = aSphere;
+        this.bSphere = bSphere;
+        this.geometry = new THREE.BufferGeometry();
+        this.positions = new Float32Array(CONNECTOR_COUNT * 3);
+        this.colors = new Float32Array(CONNECTOR_COUNT * 3);
+        this.u = new Float32Array(CONNECTOR_COUNT);
+        this.angle = new Float32Array(CONNECTOR_COUNT);
+        this.radial = new Float32Array(CONNECTOR_COUNT);
+        this.phase = new Float32Array(CONNECTOR_COUNT);
+
+        for (let i = 0; i < CONNECTOR_COUNT; i++) {
+          this.u[i] = Math.random();
+          this.angle[i] = Math.random() * Math.PI * 2;
+          // 대부분은 연결부의 표면에, 일부는 안쪽에 배치해 단순한 "튜브"가 아니라
+          // 두 구체가 실제로 분열하며 이어지는 밀도감을 만든다.
+          // 구체와 같은 "얇은 shell"처럼 보이도록 대부분의 브리지 점도
+          // 표면 쪽에 배치한다. 내부 점이 많으면 AdditiveBlending 때문에
+          // 연결부만 하얗게 뭉쳐 보여서 별도 물질처럼 느껴진다.
+          this.radial[i] = Math.random() < 0.93
+            ? 0.88 + Math.random() * 0.12
+            : Math.sqrt(Math.random()) * 0.72;
+          this.phase[i] = Math.random() * Math.PI * 2;
+          const j = i * 3;
+
+          // 양 끝은 구체 파티클과 겹치는 영역이라 밝기가 두 배로 쌓이기 쉽다.
+          // vertex color를 살짝 낮춰 "브리지 끝의 하얀 테두리"가 생기지 않게 한다.
+          const edge = Math.abs(this.u[i] * 2 - 1);
+          const seamDim = lerp(1.0, 0.52, smootherstep(0.62, 1.0, edge));
+          this.colors[j] = seamDim;
+          this.colors[j + 1] = seamDim;
+          this.colors[j + 2] = seamDim;
+
+          // 생성 첫 프레임부터 source→follower 사이에 고르게 배치해
+          // 연결부가 한 점에서 갑자기 튀어나오는 느낌을 줄인다.
+          this.positions[j] = lerp(aSphere.currentPos.x, bSphere.currentPos.x, this.u[i]);
+          this.positions[j + 1] = lerp(aSphere.currentPos.y, bSphere.currentPos.y, this.u[i]);
+          this.positions[j + 2] = lerp(aSphere.currentPos.z, bSphere.currentPos.z, this.u[i]);
+        }
+
+        this.attr = new THREE.BufferAttribute(this.positions, 3);
+        this.attr.setUsage(THREE.DynamicDrawUsage);
+        this.geometry.setAttribute("position", this.attr);
+        this.geometry.setAttribute("color", new THREE.BufferAttribute(this.colors, 3));
+
+        this.material = new THREE.PointsMaterial({
+          color: currentSphereStyle.bridgeColor,
+          size: 0.044 * currentSphereStyle.pointScale,
+          map: particleTexture,
+          vertexColors: true,
+          transparent: true,
+          opacity: 0,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          sizeAttenuation: true,
+          alphaTest: 0.02
+        });
+
+        this.points = new THREE.Points(this.geometry, this.material);
+        this.life = 1;
+        this.targetLife = 1;
+        this.dissolving = false;
+        scene.add(this.points);
+      }
+
+      startDissolve() {
+        this.dissolving = true;
+        this.targetLife = 0;
+      }
+
+      dispose() {
+        scene.remove(this.points);
+        this.geometry.dispose();
+        this.material.dispose();
+      }
+
+      update(t) {
+        const a = this.aSphere.currentPos;
+        const b = this.bSphere.currentPos;
+        const delta = new THREE.Vector3().subVectors(b, a);
+        const distance = delta.length();
+
+        this.life = lerp(this.life, this.targetLife, this.dissolving ? 0.07 : 0.12);
+
+        if (distance < 0.001) {
+          this.material.opacity = lerp(this.material.opacity, 0, 0.10);
+          return;
+        }
+
+        const dir = delta.clone().normalize();
+        const helper = Math.abs(dir.z) < 0.86
+          ? new THREE.Vector3(0, 0, 1)
+          : new THREE.Vector3(0, 1, 0);
+        const axis1 = new THREE.Vector3().crossVectors(dir, helper).normalize();
+        const axis2 = new THREE.Vector3().crossVectors(dir, axis1).normalize();
+
+        // follower가 원본 중심에서 빠져나온 직후에는 브리지를 잠깐 숨겨
+        // 파티클이 표면 접합점까지 이동할 시간을 준다. 이후 표면에서부터
+        // 서서히 드러나므로 중심에서 줄이 솟는 플래시가 보이지 않는다.
+        const visibility = smootherstep(0.045, 0.32, distance) * this.life;
+        const p = this.positions;
+
+        const radiusA = Math.max(0.08, this.aSphere.currentRadius);
+        const radiusB = Math.max(0.08, this.bSphere.currentRadius);
+        const minRadius = Math.max(0.08, Math.min(radiusA, radiusB));
+        const stretched = smootherstep(0.55, 2.9, distance);
+
+        // --------------------------------------------------------
+        // 브리지의 중심선을 구체 중심(a/b)이 아니라 두 구체가 서로 마주보는
+        // '표면 근처'에서 시작/종료시킨다.
+        // 너무 가까운 순간에는 두 표면점이 서로 교차하지 않도록 거리 비례로
+        // inset을 자동 축소한다. 이렇게 해야 첫 구체의 중심에서 줄이 뻗는
+        // 느낌이 사라지고, 표면에서 새 덩어리가 싹트듯 분열해 보인다.
+        // --------------------------------------------------------
+        const rawInsetA = radiusA * 0.84;
+        const rawInsetB = radiusB * 0.84;
+        const maxInsetSum = distance * 0.88;
+        const insetScale = Math.min(1, maxInsetSum / Math.max(0.0001, rawInsetA + rawInsetB));
+        const insetA = rawInsetA * insetScale;
+        const insetB = rawInsetB * insetScale;
+
+        const bridgeStart = a.clone().addScaledVector(dir, insetA);
+        const bridgeEnd = b.clone().addScaledVector(dir, -insetB);
+
+        // 표면의 작은 패치에서 목이 생겨나는 형태.
+        // 기존처럼 endpoint를 거의 구 반지름만큼 키우면 중심을 관통하는
+        // 두꺼운 튜브처럼 보이기 때문에, 표면 접합부는 적당히 넓고
+        // 중앙은 부드럽게 잘록해지도록 바꾼다.
+        const neckRadius = minRadius * lerp(0.30, 0.15, stretched);
+        const endpointA = Math.max(neckRadius, radiusA * 0.42);
+        const endpointB = Math.max(neckRadius, radiusB * 0.42);
+
+        // 핵심: 구체와 브리지의 "점 밀도" 자체를 맞춘다.
+        // 이전에는 작은 연결 면적에 2천 개가 넘는 점이 몰려 AdditiveBlending으로
+        // 브리지만 새하얗게 보였다. 실제 브리지 표면적을 대략 계산해 구체 표면과
+        // 비슷한 면적당 파티클 수만 draw한다.
+        const bridgeLength = bridgeStart.distanceTo(bridgeEnd);
+        const avgBridgeRadius = (endpointA + endpointB + neckRadius * 2) * 0.25;
+        const estimatedBridgeArea = Math.max(0.001, 2 * Math.PI * avgBridgeRadius * bridgeLength);
+        const referenceSphereArea = Math.max(0.001, 4 * Math.PI * minRadius * minRadius);
+        const densityMatchedCount = Math.round(
+          PARTICLE_COUNT * (estimatedBridgeArea / referenceSphereArea) * 0.90
+        );
+        const visibleConnectorCount = THREE.MathUtils.clamp(densityMatchedCount, 120, CONNECTOR_COUNT);
+        this.geometry.setDrawRange(0, visibleConnectorCount);
+
+        for (let i = 0; i < CONNECTOR_COUNT; i++) {
+          const j = i * 3;
+          // 미세한 longitudinal drift로 정적인 원통 느낌을 없앤다.
+          const rawU = this.u[i] + Math.sin(t * 0.34 + this.phase[i]) * 0.0028;
+          const u = clamp01(rawU);
+          const theta = this.angle[i] + Math.sin(t * 0.38 + this.phase[i]) * 0.055;
+
+          // quintic easing을 사용해 구체 표면 → 목 부분이 눈에 띄는 경계 없이 이어지게 한다.
+          const edge = Math.abs(u * 2 - 1);
+          const edgeBlend = smootherstep(0.10, 0.94, Math.pow(edge, 0.78));
+          const endpointRadius = lerp(endpointA, endpointB, u);
+          const profile = lerp(neckRadius, endpointRadius, edgeBlend);
+
+          // 아주 약한 유기적 맥동. 중앙에서만 조금 더 살아 움직인다.
+          const middleWeight = Math.pow(Math.sin(Math.PI * u), 2);
+          const pulse = 1 + Math.sin(t * 0.92 + this.phase[i]) * 0.026 * middleWeight;
+          const r = profile * this.radial[i] * pulse * visibility;
+
+          // 중심-중심이 아니라 표면-표면을 잇는다.
+          // 양 끝은 구체 안쪽으로 아주 살짝 파고들어 파티클 밀도가 자연스럽게
+          // 겹치고, 중앙으로 갈수록 독립된 목 형태가 드러난다.
+          const surfaceU = smootherstep(0.0, 1.0, u);
+          let cx = lerp(bridgeStart.x, bridgeEnd.x, surfaceU);
+          let cy = lerp(bridgeStart.y, bridgeEnd.y, surfaceU);
+          let cz = lerp(bridgeStart.z, bridgeEnd.z, surfaceU);
+
+          // 박수 해체 시 연결부도 독립된 점 구름처럼 바깥으로 풀려난다.
+          const clapScatter = smootherstep(0.0, 1.0, clapDissolve);
+          const scatterPhase = this.phase[i];
+          cx += Math.cos(scatterPhase * 1.71) * CLAP_SCATTER_DISTANCE * 0.72 * clapScatter;
+          cy += Math.sin(scatterPhase * 1.37) * CLAP_SCATTER_DISTANCE * 0.72 * clapScatter;
+          cz += Math.sin(scatterPhase * 2.11) * CLAP_SCATTER_DISTANCE * 0.58 * clapScatter;
+
+          // 완전한 직선 대신 거의 느껴지지 않을 정도의 흐름을 주어 유기적으로 연결.
+          const drift = Math.sin(t * 0.47 + this.phase[i] * 0.73) * 0.018 * minRadius * middleWeight;
+          cx += axis1.x * drift + axis2.x * drift * 0.35;
+          cy += axis1.y * drift + axis2.y * drift * 0.35;
+          cz += axis1.z * drift + axis2.z * drift * 0.35;
+
+          const ox = axis1.x * Math.cos(theta) * r + axis2.x * Math.sin(theta) * r;
+          const oy = axis1.y * Math.cos(theta) * r + axis2.y * Math.sin(theta) * r;
+          const oz = axis1.z * Math.cos(theta) * r + axis2.z * Math.sin(theta) * r;
+
+          // 연결부 끝은 구체 표면에 더 빠르게 붙고, 중앙은 조금 느리게 따라가도록 한다.
+          // 그래서 손을 빠르게 움직여도 양 끝이 떨어져 보이지 않으면서 가운데만 점성 있게 늘어난다.
+          const edgeFollow = Math.pow(edge, 1.7);
+          const followEase = lerp(0.15, 0.34, edgeFollow);
+          p[j] += (cx + ox - p[j]) * followEase;
+          p[j + 1] += (cy + oy - p[j + 1]) * followEase;
+          p[j + 2] += (cz + oz - p[j + 2]) * followEase;
+        }
+
+        this.attr.needsUpdate = true;
+        const clapFade = 1 - smootherstep(0.30, 0.985, clapDissolve);
+        // 밀도를 구체와 맞췄으므로 밝기/점 크기도 구체와 거의 같은 값으로 사용한다.
+        // 이제 연결부만 별도 색처럼 밝아지지 않고 하나의 파티클 표면처럼 이어진다.
+        const targetOpacity = 1.05 * visibility * clapFade;
+        this.material.opacity = lerp(this.material.opacity, targetOpacity, this.dissolving ? 0.08 : 0.075);
+        const sphereLikePointSize = lerp(0.056, 0.042, map01(minRadius, 0.18, 1.15));
+        this.material.size = lerp(this.material.size, sphereLikePointSize * currentSphereStyle.pointScale, 0.10);
+      }
+    }
+
+    // ============================================================
+    // 5. 인터랙션 상태
+    // ============================================================
+    let cloneMode = false;
+    let pointStartTime = null;
+    let flickArmed = false;
+    let lastFlickTime = -Infinity;
+    let pointReleaseStartTime = null;
+    let bentHoldStartTime = null;
+    let lastHandSeenAt = performance.now();
+    let handSeen = false;
+    let firstHandSeen = false;
+
+    // FAST CHARGE MODE용 손 흔들기 상태
+    let shakeEnergy = 0;
+    let lastShakeSampleX = 0;
+    let lastShakeSampleAt = -Infinity;
+    let lastShakeDirection = 0;
+    let lastShakeDirectionAt = -Infinity;
+    let fastChargeTarget = 0;
+    let fastChargeLevel = 0;
+    let fastChargeMode = false;
+
+    // 양손으로 집고 늘리는 분열 인터랙션 상태
+    let splitMode = false;
+    let splitBaseSpan = 0;
+    let splitAmount = 0;
+    const splitMidpoint = new THREE.Vector3();
+    const splitAxis = new THREE.Vector3(1, 0, 0);
+    const splitLeftTarget = new THREE.Vector3();
+    const splitRightTarget = new THREE.Vector3();
+    let leftSplitSphere = null;
+    let rightSplitSphere = null;
+
+    // 박수 소리 판정 상태
+    let lastClapTime = -Infinity;
+    let audioContext = null;
+    let microphoneSource = null;
+    let audioAnalyser = null;
+    let audioTimeData = null;
+    let audioFreqData = null;
+    let microphoneReady = false;
+    let microphoneStream = null;
+    let audioNoiseFloor = 0.012;
+    let previousAudioRms = 0;
+    let clapCandidateAt = -Infinity;
+    let clapCandidateRms = 0;
+
+    // 복제 완료음용 Web Audio 노드. 외부 mp3 없이 브라우저에서 직접 합성한다.
+    let cloneChimeReverb = null;
+    let cloneChimeWetGain = null;
+    let cloneChimeDryGain = null;
+    let audioClapIgnoreUntil = -Infinity;
+
+    // 배경 앰비언트/효과음용 노드
+    let mainReverb = null;
+    let mainReverbWetGain = null;
+    let mainReverbDryGain = null;
+    let ambientMasterGainNode = null;
+    let ambientBlendGainNode = null;
+    let ambientStarted = false;
+    let ambientTargetGain = 0;
+
+    // FAST CHARGE용 연속 사운드 레이어
+    let fastChargeMasterGainNode = null;
+    let fastChargeFilterNode = null;
+    let fastChargeNoiseGainNode = null;
+    let fastChargeAudioLevel = 0;
+    let fastChargeWasAudible = false;
+
+    const handTarget = new THREE.Vector3();
+    const smoothedHandTarget = new THREE.Vector3();
+
+    function getCoreGlowColor(style = currentSphereStyle) {
+      const base = new THREE.Color(style.color);
+      return base.lerp(new THREE.Color(0xffffff), 0.68);
+    }
+
+    function createCoreGlowSprite() {
+      const material = new THREE.SpriteMaterial({
+        map: coreGlowTexture,
+        color: getCoreGlowColor(),
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.setScalar(0.01);
+      scene.add(sprite);
+      return sprite;
+    }
+
+    const baseSphere = new ParticleSphere(new THREE.Vector3(0, 0, 0), 1.03);
+    let activeSphere = baseSphere;
+    const coreGlowSprite = createCoreGlowSprite();
+    const lockedSpheres = [];
+    const bridges = [];
+    const dissolvingBridges = [];
+    const dissolvingSpheres = [];
+
+    // 회전 상태
+    let hasHandOrientation = false;
+    const smoothedHandQuaternion = new THREE.Quaternion();
+    const handStartQuaternion = new THREE.Quaternion();
+    const sphereStartQuaternion = new THREE.Quaternion();
+    const tempInverseQuaternion = new THREE.Quaternion();
+    const tempDeltaQuaternion = new THREE.Quaternion();
+    const tempAppliedQuaternion = new THREE.Quaternion();
+    const tempEuler = new THREE.Euler(0, 0, 0, "YXZ");
+    let rotationReferenceReady = false;
+
+    // ============================================================
+    // 6. 손 제스처 분석
+    // ============================================================
+    function getPalmCenter(lm) {
+      const ids = [0, 5, 9, 13, 17];
+      const c = { x: 0, y: 0, z: 0 };
+      for (const id of ids) {
+        c.x += lm[id].x;
+        c.y += lm[id].y;
+        c.z += lm[id].z ?? 0;
+      }
+      c.x /= ids.length;
+      c.y /= ids.length;
+      c.z /= ids.length;
+      return c;
+    }
+
+    function getOpenness(lm, palm) {
+      const palmWidth = dist3(lm[5], lm[17]);
+      if (palmWidth < 0.0001) return 0.5;
+      const tips = [4, 8, 12, 16, 20];
+      let sum = 0;
+      for (const id of tips) sum += dist3(lm[id], palm);
+      return map01((sum / tips.length) / palmWidth, OPENNESS_MIN, OPENNESS_MAX);
+    }
+
+    function fingerExtended(lm, tipId, pipId, mcpId, palm) {
+      const dTip = dist3(lm[tipId], palm);
+      const dPip = dist3(lm[pipId], palm);
+      const dMcp = dist3(lm[mcpId], palm);
+      return dTip > dPip * 1.09 && dTip > dMcp * 1.17;
+    }
+
+    function indexStraightness(lm) {
+      const direct = dist3(lm[5], lm[8]);
+      const path = dist3(lm[5], lm[6]) + dist3(lm[6], lm[7]) + dist3(lm[7], lm[8]);
+      if (path < 1e-6) return 1;
+      return clamp01(direct / path);
+    }
+
+    function jointAngleDeg(a, b, c) {
+      const bax = a.x - b.x;
+      const bay = a.y - b.y;
+      const baz = (a.z ?? 0) - (b.z ?? 0);
+      const bcx = c.x - b.x;
+      const bcy = c.y - b.y;
+      const bcz = (c.z ?? 0) - (b.z ?? 0);
+      const la = Math.hypot(bax, bay, baz);
+      const lc = Math.hypot(bcx, bcy, bcz);
+      if (la < 1e-6 || lc < 1e-6) return 180;
+      const dot = (bax * bcx + bay * bcy + baz * bcz) / (la * lc);
+      return Math.acos(THREE.MathUtils.clamp(dot, -1, 1)) * 180 / Math.PI;
+    }
+
+    function indexBendAngle(lm) {
+      // PIP(6), DIP(7) 중 더 많이 굽혀진 관절을 사용.
+      const pip = jointAngleDeg(lm[5], lm[6], lm[8]);
+      const dip = jointAngleDeg(lm[6], lm[7], lm[8]);
+      return Math.min(pip, dip);
+    }
+
+    function getGestureState(lm, palm) {
+      const index = fingerExtended(lm, 8, 6, 5, palm);
+      const middle = fingerExtended(lm, 12, 10, 9, palm);
+      const ring = fingerExtended(lm, 16, 14, 13, palm);
+      const pinky = fingerExtended(lm, 20, 18, 17, palm);
+      const otherExtendedCount = [middle, ring, pinky].filter(Boolean).length;
+
+      // MediaPipe가 중지/약지/소지 중 하나를 순간적으로 펴졌다고 잘못 읽어도
+      // 포인팅/까딱임을 유지하도록 1개까지 허용한다.
+      const othersMostlyFolded = otherExtendedCount <= 1;
+      const pointing = index && othersMostlyFolded;
+      // clone mode 종료는 4손가락이 확실히 펴진 경우만 사용한다.
+      const openRelease = index && middle && ring && pinky;
+
+      return {
+        pointing,
+        othersFolded: othersMostlyFolded,
+        openRelease,
+        releaseFingerCount: otherExtendedCount,
+        indexStraight: indexStraightness(lm),
+        indexBendAngle: indexBendAngle(lm)
+      };
+    }
+
+    function mapScreenPointToScene(point, palmWidth = 0.18) {
+      return new THREE.Vector3(
+        (0.5 - point.x) * 4.5,
+        (0.5 - point.y) * 3.05,
+        lerp(-0.34, 0.58, map01(palmWidth, 0.08, 0.30))
+      );
+    }
+
+    function getPinchData(lm, palm) {
+      const thumbTip = lm[4];
+      const indexTip = lm[8];
+      const palmWidth = dist3(lm[5], lm[17]);
+      const pinchDistance = dist3(thumbTip, indexTip);
+      const pinchRatio = palmWidth > 1e-6 ? pinchDistance / palmWidth : 999;
+      const center = {
+        x: (thumbTip.x + indexTip.x) * 0.5,
+        y: (thumbTip.y + indexTip.y) * 0.5,
+        z: ((thumbTip.z ?? 0) + (indexTip.z ?? 0)) * 0.5
+      };
+      return {
+        pinching: pinchRatio <= PINCH_DISTANCE_RATIO,
+        pinchRatio,
+        screenPoint: center,
+        scenePoint: mapScreenPointToScene(center, palmWidth)
+      };
+    }
+
+    function analyzeHand(lm, label = "") {
+      const palm = getPalmCenter(lm);
+      return {
+        lm,
+        label,
+        palm,
+        openness: getOpenness(lm, palm),
+        gesture: getGestureState(lm, palm),
+        palmScene: mapPalmToScene(lm, palm),
+        pinch: getPinchData(lm, palm)
+      };
+    }
+
+    function getHandOrientationQuaternion(lm) {
+      const toVec3 = (p) => new THREE.Vector3(
+        0.5 - p.x,
+        0.5 - p.y,
+        -(p.z ?? 0) * 1.75
+      );
+
+      const wrist = toVec3(lm[0]);
+      const indexMcp = toVec3(lm[5]);
+      const middleMcp = toVec3(lm[9]);
+      const pinkyMcp = toVec3(lm[17]);
+
+      const xAxis = indexMcp.clone().sub(pinkyMcp);
+      const yHint = middleMcp.clone().sub(wrist);
+      if (xAxis.lengthSq() < 1e-8 || yHint.lengthSq() < 1e-8) return null;
+      xAxis.normalize();
+      yHint.normalize();
+
+      const zAxis = new THREE.Vector3().crossVectors(xAxis, yHint);
+      if (zAxis.lengthSq() < 1e-8) return null;
+      zAxis.normalize();
+      const yAxis = new THREE.Vector3().crossVectors(zAxis, xAxis).normalize();
+
+      return new THREE.Quaternion()
+        .setFromRotationMatrix(new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis))
+        .normalize();
+    }
+
+    function beginRotationReference() {
+      if (!hasHandOrientation || !activeSphere) return;
+      handStartQuaternion.copy(smoothedHandQuaternion);
+      sphereStartQuaternion.copy(activeSphere.points.quaternion);
+      activeSphere.targetQuaternion.copy(activeSphere.points.quaternion);
+      rotationReferenceReady = true;
+    }
+
+    function updateActiveSphereRotation() {
+      if (!hasHandOrientation || !rotationReferenceReady || !activeSphere) return;
+
+      tempInverseQuaternion.copy(handStartQuaternion).invert();
+      tempDeltaQuaternion.copy(smoothedHandQuaternion).multiply(tempInverseQuaternion).normalize();
+      tempEuler.setFromQuaternion(tempDeltaQuaternion, "YXZ");
+      tempEuler.x = THREE.MathUtils.clamp(tempEuler.x * ROTATION_GAIN_X, -MAX_ROTATION_DELTA, MAX_ROTATION_DELTA);
+      tempEuler.y = THREE.MathUtils.clamp(tempEuler.y * ROTATION_GAIN_Y, -MAX_ROTATION_DELTA, MAX_ROTATION_DELTA);
+      tempEuler.z = THREE.MathUtils.clamp(tempEuler.z * ROTATION_GAIN_Z, -MAX_ROTATION_DELTA, MAX_ROTATION_DELTA);
+      tempAppliedQuaternion.setFromEuler(tempEuler);
+
+      activeSphere.targetQuaternion
+        .copy(tempAppliedQuaternion)
+        .multiply(sphereStartQuaternion)
+        .normalize();
+    }
+
+    function mapPalmToScene(lm, palm) {
+      const palmWidth = dist3(lm[5], lm[17]);
+      return new THREE.Vector3(
+        (0.5 - palm.x) * 4.5,
+        (0.5 - palm.y) * 3.05,
+        lerp(-0.34, 0.58, map01(palmWidth, 0.08, 0.30))
+      );
+    }
+
+    function resetFastChargeState() {
+      shakeEnergy = 0;
+      fastChargeTarget = 0;
+      fastChargeLevel = 0;
+      fastChargeMode = false;
+      fastChargeWasAudible = false;
+      lastShakeSampleAt = -Infinity;
+      lastShakeDirectionAt = -Infinity;
+      lastShakeDirection = 0;
+    }
+
+    function ensureSplitSpheres() {
+      if (!leftSplitSphere) leftSplitSphere = new ParticleSphere(activeSphere.currentPos.clone(), SPLIT_SMALL_RADIUS);
+      if (!rightSplitSphere) rightSplitSphere = new ParticleSphere(activeSphere.currentPos.clone(), SPLIT_SMALL_RADIUS);
+      leftSplitSphere.applyStyleData(currentSphereStyleData, currentSphereStyle, { resetToBase: true, seedScattered: false });
+      rightSplitSphere.applyStyleData(currentSphereStyleData, currentSphereStyle, { resetToBase: true, seedScattered: false });
+      [leftSplitSphere, rightSplitSphere].forEach((sphere) => {
+        sphere.dissolving = false;
+        sphere.locked = false;
+        sphere.emerging = false;
+        sphere.sourceSphere = null;
+        sphere.targetLife = Math.max(sphere.targetLife, 0.001);
+        sphere.life = Math.max(sphere.life, 0.001);
+      });
+    }
+
+    function clearSplitSpheresImmediate() {
+      if (leftSplitSphere) { leftSplitSphere.dispose(); leftSplitSphere = null; }
+      if (rightSplitSphere) { rightSplitSphere.dispose(); rightSplitSphere = null; }
+    }
+
+    function resetSplitState(hard = false) {
+      splitMode = false;
+      splitBaseSpan = 0;
+      splitAmount = 0;
+      if (hard) {
+        clearSplitSpheresImmediate();
+        return;
+      }
+      [leftSplitSphere, rightSplitSphere].forEach((sphere) => {
+        if (sphere) {
+          sphere.targetLife = 0;
+          sphere.targetRadius = 0.10;
+          sphere.targetSpread = 0.20;
+        }
+      });
+    }
+
+    function updateTwoHandSplitInteraction(analyses, nowMs, interactionLocked = false) {
+      if (interactionLocked || cloneMode || analyses.length < 2) {
+        if (splitMode) resetSplitState(false);
+        return false;
+      }
+
+      const pinchHands = analyses.filter((h) => h.pinch.pinching).sort((a, b) => a.pinch.scenePoint.x - b.pinch.scenePoint.x);
+      if (pinchHands.length < 2) {
+        if (splitMode) resetSplitState(false);
+        return false;
+      }
+
+      const left = pinchHands[0];
+      const right = pinchHands[pinchHands.length - 1];
+      const midpoint = left.pinch.scenePoint.clone().add(right.pinch.scenePoint).multiplyScalar(0.5);
+      const axis = right.pinch.scenePoint.clone().sub(left.pinch.scenePoint);
+      const span = axis.length();
+      if (span < 0.05) {
+        if (splitMode) resetSplitState(false);
+        return false;
+      }
+      axis.normalize();
+
+      const anchorSphere = activeSphere || baseSphere;
+      const anchorPos = anchorSphere.currentPos.clone();
+      const attachDistance = midpoint.distanceTo(anchorPos);
+      if (!splitMode && attachDistance > SPLIT_ATTACH_DISTANCE) {
+        return false;
+      }
+
+      if (!splitMode) {
+        splitMode = true;
+        splitBaseSpan = span;
+        splitMidpoint.copy(midpoint);
+        splitAxis.copy(axis);
+        ensureSplitSpheres();
+        resetFastChargeState();
+        statusEl.textContent = "양손 pinch 감지 · 좌우로 늘리면 구체가 두 갈래로 분열합니다";
+        statusEl.classList.remove("hide");
+        setTimeout(() => statusEl.classList.add("hide"), 1400);
+      }
+
+      splitMidpoint.copy(midpoint);
+      splitAxis.copy(axis);
+      const extraSpan = Math.max(0, span - splitBaseSpan);
+      splitAmount = smootherstep(SPLIT_MIN_EXTRA_SPAN, SPLIT_MAX_EXTRA_SPAN, extraSpan);
+      ensureSplitSpheres();
+
+      const offset = lerp(0.06, SPLIT_MAX_OFFSET, splitAmount);
+      splitLeftTarget.copy(midpoint).addScaledVector(axis, -offset).lerp(left.pinch.scenePoint, 0.36 + splitAmount * 0.24);
+      splitRightTarget.copy(midpoint).addScaledVector(axis, offset).lerp(right.pinch.scenePoint, 0.36 + splitAmount * 0.24);
+
+      const baseRadius = Math.max(0.34, anchorSphere.currentRadius || 1.0);
+      const smallRadius = baseRadius * lerp(0.54, 0.42, splitAmount);
+      const smallSpread = lerp(0.11, 0.045, splitAmount);
+      [leftSplitSphere, rightSplitSphere].forEach((sphere, idx) => {
+        if (!sphere) return;
+        sphere.targetPos.copy(idx === 0 ? splitLeftTarget : splitRightTarget);
+        sphere.targetRadius = smallRadius;
+        sphere.targetSpread = smallSpread;
+        sphere.targetLife = clamp01(0.28 + splitAmount * 0.92);
+        sphere.targetQuaternion.copy(anchorSphere.targetQuaternion);
+      });
+      return true;
+    }
+
+    function updateFastChargeFromMotion(handX, nowMs) {
+      if (!Number.isFinite(lastShakeSampleAt)) {
+        lastShakeSampleX = handX;
+        lastShakeSampleAt = nowMs;
+        return;
+      }
+
+      const dt = Math.max(0.001, (nowMs - lastShakeSampleAt) / 1000);
+      shakeEnergy = Math.max(0, shakeEnergy - SHAKE_ENERGY_DECAY_PER_SEC * dt);
+
+      const vx = (handX - lastShakeSampleX) / dt;
+      const absVx = Math.abs(vx);
+      if (absVx >= SHAKE_MIN_SPEED) {
+        const dir = Math.sign(vx);
+        const velocityBoost = lerp(0.45, 1.0, map01(absVx, SHAKE_MIN_SPEED, SHAKE_MIN_SPEED * 2.5));
+        if (
+          lastShakeDirection !== 0 &&
+          dir !== lastShakeDirection &&
+          nowMs - lastShakeDirectionAt <= SHAKE_DIRECTION_WINDOW_MS
+        ) {
+          shakeEnergy = Math.min(3.5, shakeEnergy + SHAKE_DIRECTION_BOOST * velocityBoost);
+        } else {
+          shakeEnergy = Math.min(3.5, shakeEnergy + SHAKE_CONTINUOUS_BOOST * velocityBoost);
+        }
+        lastShakeDirection = dir;
+        lastShakeDirectionAt = nowMs;
+      }
+
+      lastShakeSampleX = handX;
+      lastShakeSampleAt = nowMs;
+      fastChargeTarget = clamp01((shakeEnergy - 0.22) / 0.60);
+    }
+
+    function updateFastChargeState(dtSec, handPresent, interactionLocked) {
+      const decayMultiplier = handPresent && !interactionLocked ? 0.55 : 1.25;
+      shakeEnergy = Math.max(0, shakeEnergy - SHAKE_ENERGY_DECAY_PER_SEC * dtSec * decayMultiplier);
+      if (interactionLocked) fastChargeTarget = 0;
+      else fastChargeTarget = clamp01((shakeEnergy - 0.22) / 0.60);
+
+      const ease = fastChargeTarget > fastChargeLevel ? 0.18 : 0.055;
+      fastChargeLevel = lerp(fastChargeLevel, fastChargeTarget, ease);
+
+      if (!fastChargeMode && fastChargeLevel >= FAST_CHARGE_ENTER_LEVEL) {
+        fastChargeMode = true;
+      } else if (fastChargeMode && fastChargeLevel <= FAST_CHARGE_EXIT_LEVEL) {
+        fastChargeMode = false;
+      }
+    }
+
+    function updateCoreGlow(t, interactionLocked) {
+      if (!coreGlowSprite) return;
+
+      const hasSphere = Boolean(activeSphere);
+      const chargeMix = hasSphere && !interactionLocked && !clapBlack
+        ? fastChargeLevel * clamp01(activeSphere.life ?? 1)
+        : 0;
+
+      const targetOpacity = chargeMix > 0.001
+        ? chargeMix * 0.22 * (0.93 + Math.sin(t * 4.8) * 0.06 + Math.sin(t * 2.2 + 0.7) * 0.04)
+        : 0;
+
+      coreGlowSprite.material.opacity = lerp(coreGlowSprite.material.opacity, targetOpacity, targetOpacity > coreGlowSprite.material.opacity ? 0.16 : 0.08);
+
+      if (!hasSphere) return;
+      coreGlowSprite.position.copy(activeSphere.currentPos);
+
+      const radius = Math.max(0.22, activeSphere.currentRadius || 1.0);
+      const pulse = 0.96 + Math.sin(t * 5.1) * 0.035;
+      const targetScale = radius * lerp(0.24, 0.54, chargeMix) * pulse;
+      const currentScale = coreGlowSprite.scale.x || 0.01;
+      const nextScale = lerp(currentScale, Math.max(0.01, targetScale), targetScale > currentScale ? 0.16 : 0.08);
+      coreGlowSprite.scale.setScalar(nextScale);
+    }
+
+    // ============================================================
+    // 7. 공통 오디오 그래프 / 앰비언트 / 효과음
+    // ============================================================
+    function ensureMainReverbGraph() {
+      if (!audioContext || mainReverb) return;
+
+      mainReverb = audioContext.createConvolver();
+      mainReverb.buffer = createChimeImpulse(audioContext, 6.4, 2.8);
+
+      mainReverbWetGain = audioContext.createGain();
+      mainReverbWetGain.gain.value = 0.48;
+
+      mainReverbDryGain = audioContext.createGain();
+      mainReverbDryGain.gain.value = 0.78;
+
+      const tailFilter = audioContext.createBiquadFilter();
+      tailFilter.type = "lowpass";
+      tailFilter.frequency.value = 1650;
+      tailFilter.Q.value = 0.18;
+
+      mainReverb.connect(tailFilter);
+      tailFilter.connect(mainReverbWetGain);
+      mainReverbWetGain.connect(audioContext.destination);
+      mainReverbDryGain.connect(audioContext.destination);
+    }
+
+    function ensureAmbientGraph() {
+      if (!audioContext || ambientMasterGainNode) return;
+      ensureMainReverbGraph();
+
+      ambientMasterGainNode = audioContext.createGain();
+      ambientBlendGainNode = audioContext.createGain();
+      ambientMasterGainNode.gain.value = 0.0;
+      ambientBlendGainNode.gain.value = 1.0;
+      ambientMasterGainNode.connect(ambientBlendGainNode);
+      ambientBlendGainNode.connect(mainReverbDryGain);
+      ambientBlendGainNode.connect(mainReverb);
+    }
+
+    function startAmbientBed() {
+      if (!audioContext || ambientStarted) return;
+      ensureAmbientGraph();
+      if (!ambientMasterGainNode) return;
+      ambientStarted = true;
+
+      const now = audioContext.currentTime;
+
+      const makeVoice = ({
+        freq,
+        gain,
+        detune = 0,
+        lfoRate = 0.02,
+        lfoDepth = 2.0,
+        lowpass = 1100,
+        phaseOffset = 0
+      }) => {
+        const osc = audioContext.createOscillator();
+        const voiceGain = audioContext.createGain();
+        const filter = audioContext.createBiquadFilter();
+        const pitchLfo = audioContext.createOscillator();
+        const pitchLfoGain = audioContext.createGain();
+        const breathLfo = audioContext.createOscillator();
+        const breathLfoGain = audioContext.createGain();
+
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, now);
+        osc.detune.value = detune;
+
+        filter.type = "lowpass";
+        filter.frequency.value = lowpass;
+        filter.Q.value = 0.18;
+
+        // 음량 변화도 매우 느리게: 음악처럼 들리지 않고 공간 자체가 호흡하는 정도.
+        voiceGain.gain.value = gain;
+        breathLfo.type = "sine";
+        breathLfo.frequency.value = lfoRate * 0.62;
+        breathLfoGain.gain.value = gain * 0.12;
+        breathLfo.connect(breathLfoGain);
+        breathLfoGain.connect(voiceGain.gain);
+
+        pitchLfo.type = "sine";
+        pitchLfo.frequency.value = lfoRate;
+        pitchLfoGain.gain.value = lfoDepth;
+        pitchLfo.connect(pitchLfoGain);
+        pitchLfoGain.connect(osc.detune);
+
+        osc.connect(filter);
+        filter.connect(voiceGain);
+        voiceGain.connect(ambientMasterGainNode);
+
+        osc.start(now + phaseOffset);
+        pitchLfo.start(now + phaseOffset);
+        breathLfo.start(now + phaseOffset);
+      };
+
+      // D 계열의 넓은 오픈 보이싱. 저중역이 중심이라 노트북 스피커에서도 부드럽게 들린다.
+      makeVoice({ freq: 73.42,  gain: 0.19, detune: -4, lfoRate: 0.014, lfoDepth: 1.4, lowpass: 360 });
+      makeVoice({ freq: 110.00, gain: 0.115, detune: 2, lfoRate: 0.019, lfoDepth: 1.8, lowpass: 520, phaseOffset: 0.03 });
+      makeVoice({ freq: 146.83, gain: 0.075, detune: -2, lfoRate: 0.026, lfoDepth: 2.2, lowpass: 820, phaseOffset: 0.06 });
+      makeVoice({ freq: 185.00, gain: 0.042, detune: 3, lfoRate: 0.031, lfoDepth: 2.0, lowpass: 1050, phaseOffset: 0.09 });
+      makeVoice({ freq: 220.00, gain: 0.020, detune: -3, lfoRate: 0.022, lfoDepth: 1.6, lowpass: 1200, phaseOffset: 0.12 });
+
+      // 완전히 무음에 가깝게만 존재하는 공기층. 거친 화이트노이즈는 쓰지 않는다.
+      const noiseBuffer = audioContext.createBuffer(1, audioContext.sampleRate * 2, audioContext.sampleRate);
+      const data = noiseBuffer.getChannelData(0);
+      let smooth = 0;
+      for (let i = 0; i < data.length; i++) {
+        smooth += ((Math.random() * 2 - 1) - smooth) * 0.025;
+        data[i] = smooth;
+      }
+
+      const noise = audioContext.createBufferSource();
+      const airFilter = audioContext.createBiquadFilter();
+      const airGain = audioContext.createGain();
+
+      noise.buffer = noiseBuffer;
+      noise.loop = true;
+      airFilter.type = "bandpass";
+      airFilter.frequency.value = 640;
+      airFilter.Q.value = 0.28;
+      airGain.gain.value = 0.0045;
+
+      noise.connect(airFilter);
+      airFilter.connect(airGain);
+      airGain.connect(ambientMasterGainNode);
+      noise.start(now);
+    }
+
+    function setAmbientTargetGain(value, ramp = 0.85) {
+      ambientTargetGain = value;
+      if (!audioContext || !ambientMasterGainNode || audioContext.state !== "running") return;
+      const now = audioContext.currentTime;
+      ambientMasterGainNode.gain.cancelScheduledValues(now);
+      ambientMasterGainNode.gain.setTargetAtTime(Math.max(0.0001, value), now, ramp);
+    }
+
+    function updateAmbientState() {
+      if (!audioContext || !ambientMasterGainNode || audioContext.state !== "running") return;
+      let target = AMBIENT_MASTER_GAIN;
+      if (clapBlack && clapDissolve > 0.98) target = AMBIENT_BLACK_GAIN;
+      else if (clapDissolve > 0.06 || clapDissolveTarget > 0.5) target = AMBIENT_TRANSITION_GAIN;
+      if (Math.abs(target - ambientTargetGain) > 0.0035) setAmbientTargetGain(target, 0.95);
+    }
+
+    function ensureFastChargeGraph() {
+      if (!audioContext || fastChargeMasterGainNode) return;
+      ensureMainReverbGraph();
+
+      const now = audioContext.currentTime;
+      fastChargeMasterGainNode = audioContext.createGain();
+      fastChargeMasterGainNode.gain.value = 0.0001;
+
+      fastChargeFilterNode = audioContext.createBiquadFilter();
+      fastChargeFilterNode.type = "lowpass";
+      fastChargeFilterNode.frequency.value = 780;
+      fastChargeFilterNode.Q.value = 0.18;
+
+      const dry = audioContext.createGain();
+      const wet = audioContext.createGain();
+      dry.gain.value = 0.32;
+      wet.gain.value = 0.48;
+
+      fastChargeMasterGainNode.connect(fastChargeFilterNode);
+      fastChargeFilterNode.connect(dry);
+      fastChargeFilterNode.connect(wet);
+      dry.connect(mainReverbDryGain);
+      wet.connect(mainReverb);
+
+      const makeChargeVoice = ({ freq, gain, detune = 0, lowpass = 1200, phaseOffset = 0, lfoRate = 0.09, lfoDepth = 2.2 }) => {
+        const osc = audioContext.createOscillator();
+        const voiceGain = audioContext.createGain();
+        const filter = audioContext.createBiquadFilter();
+        const lfo = audioContext.createOscillator();
+        const lfoGain = audioContext.createGain();
+
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, now);
+        osc.detune.value = detune;
+
+        filter.type = "lowpass";
+        filter.frequency.value = lowpass;
+        filter.Q.value = 0.16;
+
+        voiceGain.gain.value = gain;
+
+        lfo.type = "sine";
+        lfo.frequency.value = lfoRate;
+        lfoGain.gain.value = lfoDepth;
+        lfo.connect(lfoGain);
+        lfoGain.connect(osc.detune);
+
+        osc.connect(filter);
+        filter.connect(voiceGain);
+        voiceGain.connect(fastChargeMasterGainNode);
+
+        osc.start(now + phaseOffset);
+        lfo.start(now + phaseOffset);
+      };
+
+      // 앰비언트와 같은 D 계열을 유지하되, 고속 충전 중에는 더 응축된 저중역층이 올라온다.
+      makeChargeVoice({ freq: 73.42,  gain: 0.10, detune: -2, lowpass: 480,  phaseOffset: 0.00, lfoRate: 0.06, lfoDepth: 1.4 });
+      makeChargeVoice({ freq: 110.00, gain: 0.072, detune:  2, lowpass: 720,  phaseOffset: 0.02, lfoRate: 0.08, lfoDepth: 1.8 });
+      makeChargeVoice({ freq: 146.83, gain: 0.040, detune: -1, lowpass: 980,  phaseOffset: 0.05, lfoRate: 0.10, lfoDepth: 2.2 });
+      makeChargeVoice({ freq: 220.00, gain: 0.015, detune:  1, lowpass: 1280, phaseOffset: 0.08, lfoRate: 0.13, lfoDepth: 2.0 });
+
+      const noiseBuffer = audioContext.createBuffer(1, audioContext.sampleRate * 2, audioContext.sampleRate);
+      const data = noiseBuffer.getChannelData(0);
+      let smooth = 0;
+      let slower = 0;
+      for (let i = 0; i < data.length; i++) {
+        const white = Math.random() * 2 - 1;
+        smooth += (white - smooth) * 0.032;
+        slower += (smooth - slower) * 0.010;
+        data[i] = slower;
+      }
+
+      const noise = audioContext.createBufferSource();
+      const noiseFilter = audioContext.createBiquadFilter();
+      fastChargeNoiseGainNode = audioContext.createGain();
+      noise.buffer = noiseBuffer;
+      noise.loop = true;
+      noiseFilter.type = "bandpass";
+      noiseFilter.frequency.value = 980;
+      noiseFilter.Q.value = 0.28;
+      fastChargeNoiseGainNode.gain.value = 0.0001;
+      noise.connect(noiseFilter);
+      noiseFilter.connect(fastChargeNoiseGainNode);
+      fastChargeNoiseGainNode.connect(fastChargeMasterGainNode);
+      noise.start(now);
+    }
+
+    function playFastChargeBloom() {
+      if (!audioContext || audioContext.state !== "running") return;
+      ensureMainReverbGraph();
+      const now = audioContext.currentTime;
+      const master = audioContext.createGain();
+      const filter = audioContext.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.setValueAtTime(820, now);
+      filter.frequency.exponentialRampToValueAtTime(1320, now + 1.05);
+      filter.Q.value = 0.14;
+
+      master.gain.setValueAtTime(0.0001, now);
+      master.gain.exponentialRampToValueAtTime(0.030, now + 0.12);
+      master.gain.exponentialRampToValueAtTime(0.016, now + 0.55);
+      master.gain.exponentialRampToValueAtTime(0.0001, now + 1.4);
+
+      [110.00, 146.83, 220.00].forEach((f, i) => {
+        const osc = audioContext.createOscillator();
+        const g = audioContext.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(f * 0.992, now);
+        osc.frequency.exponentialRampToValueAtTime(f, now + 0.72 + i * 0.04);
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.exponentialRampToValueAtTime(0.18 / (1 + i * 0.75), now + 0.14 + i * 0.03);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + 1.25);
+        osc.connect(g);
+        g.connect(master);
+        osc.start(now);
+        osc.stop(now + 1.35);
+      });
+
+      master.connect(filter);
+      const dry = audioContext.createGain();
+      const wet = audioContext.createGain();
+      dry.gain.value = 0.34;
+      wet.gain.value = 0.60;
+      filter.connect(dry);
+      filter.connect(wet);
+      dry.connect(mainReverbDryGain);
+      wet.connect(mainReverb);
+
+      setTimeout(() => {
+        try { master.disconnect(); } catch (_) {}
+        try { filter.disconnect(); } catch (_) {}
+        try { dry.disconnect(); } catch (_) {}
+        try { wet.disconnect(); } catch (_) {}
+      }, 1900);
+    }
+
+    function updateFastChargeAudio() {
+      if (!audioContext || audioContext.state !== "running") return;
+      ensureFastChargeGraph();
+      if (!fastChargeMasterGainNode || !fastChargeFilterNode) return;
+
+      const now = audioContext.currentTime;
+      const targetLevel = clapBlack ? 0 : fastChargeLevel;
+      const becameAudible = !fastChargeWasAudible && targetLevel >= 0.22;
+      fastChargeWasAudible = targetLevel >= 0.12;
+      if (becameAudible) playFastChargeBloom();
+
+      fastChargeAudioLevel = lerp(fastChargeAudioLevel, targetLevel, targetLevel > fastChargeAudioLevel ? 0.18 : 0.08);
+      const targetGain = 0.0001 + fastChargeAudioLevel * 0.060;
+      const targetFilter = 760 + fastChargeAudioLevel * 980;
+      const targetNoiseGain = 0.0001 + fastChargeAudioLevel * 0.010;
+
+      fastChargeMasterGainNode.gain.cancelScheduledValues(now);
+      fastChargeMasterGainNode.gain.setTargetAtTime(targetGain, now, 0.12);
+      fastChargeFilterNode.frequency.cancelScheduledValues(now);
+      fastChargeFilterNode.frequency.setTargetAtTime(targetFilter, now, 0.14);
+      if (fastChargeNoiseGainNode) {
+        fastChargeNoiseGainNode.gain.cancelScheduledValues(now);
+        fastChargeNoiseGainNode.gain.setTargetAtTime(targetNoiseGain, now, 0.16);
+      }
+    }
+
+    function playDissolveWhoosh() {
+      if (!audioContext || audioContext.state !== "running") return;
+      ensureMainReverbGraph();
+
+      const now = audioContext.currentTime;
+      audioClapIgnoreUntil = performance.now() + CLAP_DISSOLVE_GUARD_MS;
+
+      const master = audioContext.createGain();
+      const darkFilter = audioContext.createBiquadFilter();
+      const compressor = audioContext.createDynamicsCompressor();
+
+      darkFilter.type = "lowpass";
+      darkFilter.frequency.setValueAtTime(1050, now);
+      darkFilter.frequency.exponentialRampToValueAtTime(320, now + 3.6);
+      darkFilter.Q.value = 0.16;
+
+      compressor.threshold.value = -28;
+      compressor.knee.value = 28;
+      compressor.ratio.value = 1.45;
+      compressor.attack.value = 0.10;
+      compressor.release.value = 0.95;
+
+      // 어택이 거의 느껴지지 않게 서서히 피었다가 4초 이상 길게 사라진다.
+      master.gain.setValueAtTime(0.0001, now);
+      master.gain.exponentialRampToValueAtTime(0.050, now + 0.48);
+      master.gain.exponentialRampToValueAtTime(0.043, now + 1.10);
+      master.gain.exponentialRampToValueAtTime(0.017, now + 2.55);
+      master.gain.exponentialRampToValueAtTime(0.0001, now + 4.65);
+
+      const tones = [
+        { from: 146.83, to: 73.42,  gain: 0.52 },
+        { from: 220.00, to: 110.00, gain: 0.24 },
+        { from: 293.66, to: 146.83, gain: 0.080 }
+      ];
+
+      tones.forEach((tone, i) => {
+        const osc = audioContext.createOscillator();
+        const g = audioContext.createGain();
+
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(tone.from, now);
+        osc.frequency.exponentialRampToValueAtTime(tone.to, now + 3.55);
+
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.exponentialRampToValueAtTime(tone.gain, now + 0.42 + i * 0.06);
+        g.gain.exponentialRampToValueAtTime(tone.gain * 0.48, now + 1.35);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + 4.25);
+
+        osc.connect(g);
+        g.connect(master);
+        osc.start(now);
+        osc.stop(now + 4.45);
+      });
+
+      // 아주 약한 저역 공기 흐름만 추가. '파앗' 같은 노이즈 어택은 제거.
+      const noiseBuffer = audioContext.createBuffer(1, Math.floor(audioContext.sampleRate * 4.2), audioContext.sampleRate);
+      const nd = noiseBuffer.getChannelData(0);
+      let smooth = 0;
+      for (let i = 0; i < nd.length; i++) {
+        smooth += ((Math.random() * 2 - 1) - smooth) * 0.018;
+        const x = i / nd.length;
+        nd[i] = smooth * Math.pow(1 - x, 0.45);
+      }
+      const noise = audioContext.createBufferSource();
+      const noiseFilter = audioContext.createBiquadFilter();
+      const noiseGain = audioContext.createGain();
+
+      noise.buffer = noiseBuffer;
+      noiseFilter.type = "bandpass";
+      noiseFilter.frequency.setValueAtTime(420, now);
+      noiseFilter.frequency.exponentialRampToValueAtTime(190, now + 3.5);
+      noiseFilter.Q.value = 0.30;
+
+      noiseGain.gain.setValueAtTime(0.0001, now);
+      noiseGain.gain.exponentialRampToValueAtTime(0.080, now + 0.65);
+      noiseGain.gain.exponentialRampToValueAtTime(0.025, now + 2.1);
+      noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + 4.0);
+
+      noise.connect(noiseFilter);
+      noiseFilter.connect(noiseGain);
+      noiseGain.connect(master);
+      noise.start(now);
+      noise.stop(now + 4.2);
+
+      master.connect(darkFilter);
+      darkFilter.connect(compressor);
+
+      const dry = audioContext.createGain();
+      const wet = audioContext.createGain();
+      dry.gain.value = 0.46;
+      wet.gain.value = 0.78;
+
+      compressor.connect(dry);
+      compressor.connect(wet);
+      dry.connect(mainReverbDryGain);
+      wet.connect(mainReverb);
+
+      setAmbientTargetGain(AMBIENT_TRANSITION_GAIN * 0.70, 0.85);
+
+      setTimeout(() => {
+        try { master.disconnect(); } catch (_) {}
+        try { darkFilter.disconnect(); } catch (_) {}
+        try { compressor.disconnect(); } catch (_) {}
+        try { dry.disconnect(); } catch (_) {}
+        try { wet.disconnect(); } catch (_) {}
+      }, 5600);
+    }
+
+    function playRestoreWhoosh() {
+      if (!audioContext || audioContext.state !== "running") return;
+      ensureMainReverbGraph();
+
+      const now = audioContext.currentTime;
+      audioClapIgnoreUntil = performance.now() + CLAP_RESTORE_GUARD_MS;
+
+      const master = audioContext.createGain();
+      const warmFilter = audioContext.createBiquadFilter();
+      const compressor = audioContext.createDynamicsCompressor();
+
+      warmFilter.type = "lowpass";
+      warmFilter.frequency.setValueAtTime(520, now);
+      warmFilter.frequency.exponentialRampToValueAtTime(1450, now + 2.1);
+      warmFilter.frequency.exponentialRampToValueAtTime(1050, now + 4.2);
+      warmFilter.Q.value = 0.16;
+
+      compressor.threshold.value = -28;
+      compressor.knee.value = 28;
+      compressor.ratio.value = 1.45;
+      compressor.attack.value = 0.09;
+      compressor.release.value = 0.95;
+
+      master.gain.setValueAtTime(0.0001, now);
+      master.gain.exponentialRampToValueAtTime(0.018, now + 0.42);
+      master.gain.exponentialRampToValueAtTime(0.049, now + 1.28);
+      master.gain.exponentialRampToValueAtTime(0.041, now + 2.05);
+      master.gain.exponentialRampToValueAtTime(0.0001, now + 4.85);
+
+      // 낮은 음이 위로 모이며 최종적으로 따뜻한 코드가 형성되는 구조.
+      const rises = [
+        { from: 73.42,  to: 146.83, gain: 0.46 },
+        { from: 110.00, to: 185.00, gain: 0.25 },
+        { from: 146.83, to: 220.00, gain: 0.12 }
+      ];
+
+      rises.forEach((tone, i) => {
+        const osc = audioContext.createOscillator();
+        const g = audioContext.createGain();
+
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(tone.from, now);
+        osc.frequency.exponentialRampToValueAtTime(tone.to, now + 1.65 + i * 0.10);
+
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.exponentialRampToValueAtTime(tone.gain * 0.32, now + 0.40);
+        g.gain.exponentialRampToValueAtTime(tone.gain, now + 1.38 + i * 0.08);
+        g.gain.exponentialRampToValueAtTime(tone.gain * 0.36, now + 2.55);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + 4.55);
+
+        osc.connect(g);
+        g.connect(master);
+        osc.start(now);
+        osc.stop(now + 4.70);
+      });
+
+      // 최종 구체가 잡힐 때 '딩'이 아니라 아주 은은한 코드의 잔광만 남긴다.
+      const settle = [
+        { f: 146.83, gain: 0.15 },
+        { f: 185.00, gain: 0.090 },
+        { f: 220.00, gain: 0.055 },
+        { f: 293.66, gain: 0.020 }
+      ];
+
+      settle.forEach((tone, i) => {
+        const osc = audioContext.createOscillator();
+        const g = audioContext.createGain();
+
+        osc.type = "sine";
+        osc.frequency.value = tone.f;
+
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + 0.85);
+        g.gain.exponentialRampToValueAtTime(tone.gain, now + 1.65 + i * 0.035);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + 4.80);
+
+        osc.connect(g);
+        g.connect(master);
+        osc.start(now);
+        osc.stop(now + 4.95);
+      });
+
+      master.connect(warmFilter);
+      warmFilter.connect(compressor);
+
+      const dry = audioContext.createGain();
+      const wet = audioContext.createGain();
+      dry.gain.value = 0.44;
+      wet.gain.value = 0.82;
+
+      compressor.connect(dry);
+      compressor.connect(wet);
+      dry.connect(mainReverbDryGain);
+      wet.connect(mainReverb);
+
+      setAmbientTargetGain(AMBIENT_TRANSITION_GAIN * 0.78, 0.85);
+
+      setTimeout(() => {
+        try { master.disconnect(); } catch (_) {}
+        try { warmFilter.disconnect(); } catch (_) {}
+        try { compressor.disconnect(); } catch (_) {}
+        try { dry.disconnect(); } catch (_) {}
+        try { wet.disconnect(); } catch (_) {}
+      }, 5700);
+    }
+
+    // ============================================================
+    // 7. 구체 복제 완료음
+    // ============================================================
+    function createChimeImpulse(ctx, seconds = 5.8, decay = 3.0) {
+      const rate = ctx.sampleRate;
+      const length = Math.max(1, Math.floor(rate * seconds));
+      const impulse = ctx.createBuffer(2, length, rate);
+
+      for (let ch = 0; ch < impulse.numberOfChannels; ch++) {
+        const data = impulse.getChannelData(ch);
+        let smoothNoise = 0;
+        let slowNoise = 0;
+
+        for (let i = 0; i < length; i++) {
+          const x = i / length;
+          const white = Math.random() * 2 - 1;
+
+          // 거친 고주파 잔향을 없애고 부드러운 저중역 확산만 남긴다.
+          smoothNoise += (white - smoothNoise) * 0.055;
+          slowNoise += (smoothNoise - slowNoise) * 0.018;
+
+          const envelope = Math.pow(1 - x, decay);
+          const earlyBloom = Math.exp(-x * 7.5);
+          const diffuse = slowNoise * 0.78 + smoothNoise * 0.22;
+
+          data[i] = diffuse * envelope * (0.72 + earlyBloom * 0.28);
+        }
+      }
+      return impulse;
+    }
+
+    function ensureCloneChimeGraph() {
+      if (!audioContext || cloneChimeReverb) return;
+
+      cloneChimeReverb = audioContext.createConvolver();
+      cloneChimeReverb.buffer = createChimeImpulse(
+        audioContext,
+        CLONE_CHIME_REVERB_SECONDS,
+        2.85
+      );
+
+      const reverbFilter = audioContext.createBiquadFilter();
+      reverbFilter.type = "lowpass";
+      reverbFilter.frequency.value = 1650;
+      reverbFilter.Q.value = 0.16;
+
+      cloneChimeWetGain = audioContext.createGain();
+      cloneChimeWetGain.gain.value = 0.56;
+
+      cloneChimeDryGain = audioContext.createGain();
+      cloneChimeDryGain.gain.value = 0.54;
+
+      cloneChimeReverb.connect(reverbFilter);
+      reverbFilter.connect(cloneChimeWetGain);
+      cloneChimeWetGain.connect(audioContext.destination);
+      cloneChimeDryGain.connect(audioContext.destination);
+    }
+
+    function playCloneChime() {
+      if (!audioContext || audioContext.state !== "running") return;
+
+      ensureCloneChimeGraph();
+      if (!cloneChimeReverb || !cloneChimeWetGain || !cloneChimeDryGain) return;
+
+      const now = audioContext.currentTime;
+      audioClapIgnoreUntil = performance.now() + CLONE_CHIME_CLAP_GUARD_MS;
+
+      const master = audioContext.createGain();
+      const bodyFilter = audioContext.createBiquadFilter();
+      const compressor = audioContext.createDynamicsCompressor();
+
+      bodyFilter.type = "lowpass";
+      bodyFilter.frequency.setValueAtTime(1550, now);
+      bodyFilter.frequency.exponentialRampToValueAtTime(1120, now + 4.6);
+      bodyFilter.Q.value = 0.14;
+
+      compressor.threshold.value = -27;
+      compressor.knee.value = 28;
+      compressor.ratio.value = 1.55;
+      compressor.attack.value = 0.055;
+      compressor.release.value = 0.85;
+
+      // 기존 '띵'의 짧은 어택을 없애고, 부팅음처럼 코드가 부드럽게 피어난다.
+      master.gain.setValueAtTime(0.0001, now);
+      master.gain.exponentialRampToValueAtTime(CLONE_CHIME_MASTER_GAIN, now + 0.085);
+      master.gain.exponentialRampToValueAtTime(CLONE_CHIME_MASTER_GAIN * 0.70, now + 0.72);
+      master.gain.exponentialRampToValueAtTime(CLONE_CHIME_MASTER_GAIN * 0.19, now + 2.65);
+      master.gain.exponentialRampToValueAtTime(0.0001, now + 5.25);
+
+      const chord = [
+        { f: 110.00, gain: 0.29, attack: 0.060, decay: 4.75, detune: -2 },
+        { f: 146.83, gain: 0.52, attack: 0.070, decay: 5.05, detune:  1 },
+        { f: 185.00, gain: 0.28, attack: 0.085, decay: 4.65, detune: -1 },
+        { f: 220.00, gain: 0.17, attack: 0.100, decay: 4.35, detune:  2 },
+        { f: 293.66, gain: 0.055, attack: 0.120, decay: 3.80, detune: -2 }
+      ];
+
+      chord.forEach((tone) => {
+        const osc = audioContext.createOscillator();
+        const g = audioContext.createGain();
+
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(tone.f, now);
+        osc.detune.value = tone.detune;
+
+        // 거의 알아차리지 못할 정도로만 아래로 착지.
+        osc.frequency.exponentialRampToValueAtTime(tone.f * 0.997, now + 1.4);
+
+        g.gain.setValueAtTime(0.0001, now);
+        g.gain.exponentialRampToValueAtTime(tone.gain, now + tone.attack);
+        g.gain.exponentialRampToValueAtTime(tone.gain * 0.62, now + 0.82);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + tone.decay);
+
+        osc.connect(g);
+        g.connect(master);
+        osc.start(now);
+        osc.stop(now + tone.decay + 0.10);
+      });
+
+      master.connect(bodyFilter);
+      bodyFilter.connect(compressor);
+      compressor.connect(cloneChimeDryGain);
+      compressor.connect(cloneChimeReverb);
+
+      setTimeout(() => {
+        try { master.disconnect(); } catch (_) {}
+        try { bodyFilter.disconnect(); } catch (_) {}
+        try { compressor.disconnect(); } catch (_) {}
+      }, 6500);
+    }
+
+    // ============================================================
+    // 8. Clone Mode 상태 머신
+    // ============================================================
+    function enableCloneMode(nowMs) {
+      if (cloneMode) return;
+      cloneMode = true;
+      pointStartTime = null;
+      pointReleaseStartTime = null;
+      bentHoldStartTime = null;
+      flickArmed = true; // 포인팅 상태에서 들어오므로 즉시 까딱임 대기
+      lastFlickTime = nowMs - FLICK_REARM_MS;
+
+      // 포인팅 순간부터 구 크기를 일정하게 만들어 복제 형태를 선명하게 유지
+      activeSphere.targetRadius = FOLLOWER_RADIUS;
+      activeSphere.targetSpread = 0.07;
+
+      modeEl.textContent = "CLONE MODE · 검지 굽힘 = FIX / 손바닥 펼침 = CLEAR";
+      statusEl.textContent = "복제 모드 ON · 검지를 구부리면 현재 위치에 구체가 고정됩니다";
+      statusEl.classList.remove("hide");
+      setTimeout(() => statusEl.classList.add("hide"), 1800);
+    }
+
+    function spawnFollowerFrom(sourceSphere) {
+      const follower = new ParticleSphere(sourceSphere.currentPos.clone(), 0.08);
+      follower.currentRadius = 0.08;
+      follower.targetRadius = 0.08;
+      follower.currentSpread = 0.24;
+      follower.targetSpread = 0.12;
+      follower.material.opacity = 0.0;
+      follower.life = 0.0;
+      follower.targetLife = 0.0;
+      follower.emerging = true;
+      follower.locked = false;
+      follower.lockPosition = null;
+      follower.sourceSphere = sourceSphere;
+      follower.targetQuaternion.copy(sourceSphere.points.quaternion);
+      follower.points.quaternion.copy(sourceSphere.points.quaternion);
+
+      const bridge = new ParticleBridge(sourceSphere, follower);
+      bridges.push(bridge);
+      activeSphere = follower;
+      beginRotationReference();
+    }
+
+    function lockAndClone(nowMs) {
+      if (!cloneMode || !activeSphere) return;
+
+      // 새 follower가 거의 원본 위치에 겹쳐 있을 때 연속 오인식을 방지
+      if (activeSphere.emerging && activeSphere.sourceSphere) {
+        const d = activeSphere.currentPos.distanceTo(activeSphere.sourceSphere.currentPos);
+        if (d < LOCK_MIN_DISTANCE) {
+          statusEl.textContent = "손을 조금 이동한 뒤 다시 검지를 까딱해주세요";
+          statusEl.classList.remove("hide");
+          setTimeout(() => statusEl.classList.add("hide"), 900);
+          return;
+        }
+      }
+
+      activeSphere.locked = true;
+      activeSphere.emerging = false;
+      // 현재 보이는 위치를 별도 anchor로 저장한다.
+      // 이후 activeSphere가 새 follower로 바뀌어도 이 구체는 절대 손을 따라가지 않는다.
+      activeSphere.lockPosition = activeSphere.currentPos.clone();
+      activeSphere.lockQuaternion.copy(activeSphere.points.quaternion);
+      activeSphere.targetPos.copy(activeSphere.lockPosition);
+      activeSphere.targetQuaternion.copy(activeSphere.lockQuaternion);
+      activeSphere.targetRadius = FOLLOWER_RADIUS;
+      activeSphere.targetSpread = 0.07;
+      activeSphere.targetLife = 1;
+      activeSphere.life = Math.max(activeSphere.life, 0.98);
+      if (!lockedSpheres.includes(activeSphere)) lockedSpheres.push(activeSphere);
+
+      // 첫 구체를 포함하여 최대 개수 제한
+      if (lockedSpheres.length >= MAX_SPHERES) {
+        statusEl.textContent = `최대 ${MAX_SPHERES}개까지 생성됩니다 · R 키로 초기화`;
+        statusEl.classList.remove("hide");
+        setTimeout(() => statusEl.classList.add("hide"), 1200);
+        activeSphere = lockedSpheres[lockedSpheres.length - 1];
+        return;
+      }
+
+      const justLocked = activeSphere;
+      spawnFollowerFrom(justLocked);
+      // 검지 까딱으로 구체 하나가 성공적으로 고정되고 다음 복제가 시작되는 순간 울림음 재생
+      playCloneChime();
+      lastFlickTime = nowMs;
+
+      statusEl.textContent = `구체 ${lockedSpheres.length}개 고정 · 손을 옮긴 뒤 다시 까딱하세요`;
+      statusEl.classList.remove("hide");
+      setTimeout(() => statusEl.classList.add("hide"), 1000);
+    }
+
+    function exitCloneModeSoft() {
+      if (!cloneMode) return;
+
+      cloneMode = false;
+      resetSplitState(true);
+      pointStartTime = null;
+      pointReleaseStartTime = null;
+      bentHoldStartTime = null;
+      flickArmed = false;
+      modeEl.textContent = "NORMAL · 검지 포인팅으로 CLONE MODE";
+
+      // base sphere 외 복제 구체는 자신이 태어난 이전 구체 쪽으로 수축하며 사라진다.
+      const extras = new Set([...lockedSpheres, activeSphere]);
+      extras.delete(baseSphere);
+      extras.forEach((sphere) => {
+        if (!sphere || sphere.dissolving) return;
+        const collapseTarget = sphere.sourceSphere?.currentPos ?? baseSphere.currentPos;
+        sphere.startDissolve(collapseTarget.clone());
+        dissolvingSpheres.push(sphere);
+      });
+
+      // 브리지도 즉시 끊지 않고 같은 속도로 fade-out시켜 연결이 자연스럽게 풀린다.
+      bridges.forEach((bridge) => {
+        bridge.startDissolve();
+        dissolvingBridges.push(bridge);
+      });
+      bridges.length = 0;
+      lockedSpheres.length = 0;
+
+      activeSphere = baseSphere;
+      baseSphere.locked = false;
+      baseSphere.lockPosition = null;
+      baseSphere.emerging = false;
+      baseSphere.sourceSphere = null;
+      baseSphere.targetLife = 1;
+      baseSphere.life = Math.max(baseSphere.life, 0.9);
+      beginRotationReference();
+
+      statusEl.textContent = "포인팅 종료 · 복제된 구체를 해체합니다";
+      statusEl.classList.remove("hide");
+      setTimeout(() => statusEl.classList.add("hide"), 900);
+    }
+
+    function resetScene() {
+      cloneMode = false;
+      resetFastChargeState();
+      resetSplitState(true);
+      pointStartTime = null;
+      flickArmed = false;
+      modeEl.textContent = "NORMAL · 검지 포인팅으로 CLONE MODE";
+
+      // baseSphere 외 구체/브리지는 부드럽게 사라짐
+      const allExtra = new Set([...lockedSpheres, activeSphere]);
+      allExtra.delete(baseSphere);
+      allExtra.forEach((s) => {
+        if (s && !s.dissolving) {
+          s.startDissolve(new THREE.Vector3(0, 0, 0));
+          dissolvingSpheres.push(s);
+        }
+      });
+
+      bridges.forEach((b) => b.dispose());
+      bridges.length = 0;
+      dissolvingBridges.forEach((b) => b.dispose());
+      dissolvingBridges.length = 0;
+      lockedSpheres.length = 0;
+
+      activeSphere = baseSphere;
+      baseSphere.locked = false;
+      baseSphere.lockPosition = null;
+      baseSphere.emerging = false;
+      baseSphere.sourceSphere = null;
+      baseSphere.targetPos.set(0, 0, 0);
+      baseSphere.currentRadius = 0.24;
+      baseSphere.targetRadius = 1.03;
+      baseSphere.currentSpread = 0.85;
+      baseSphere.targetSpread = 0.075;
+      baseSphere.life = 1;
+      baseSphere.targetLife = 1;
+      baseSphere.material.opacity = currentSphereStyle.opacity;
+      beginRotationReference();
+
+      statusEl.textContent = "초기화 · 하나의 구체로 돌아왔습니다";
+      statusEl.classList.remove("hide");
+      setTimeout(() => statusEl.classList.add("hide"), 1200);
+    }
+
+    function processCloneGestures(gesture, nowMs) {
+      if (!cloneMode) {
+        if (gesture.pointing) {
+          if (pointStartTime == null) pointStartTime = nowMs;
+          if (nowMs - pointStartTime >= POINT_TRIGGER_MS) {
+            enableCloneMode(nowMs);
+          }
+        } else {
+          pointStartTime = null;
+        }
+        return;
+      }
+
+      // clone mode 종료는 오직 "손바닥을 확실히 펼친 상태"가 일정 시간 유지될 때만.
+      // 검지를 굽혀 복제하는 중이나 손 추적이 잠깐 흔들릴 때는 절대 종료하지 않는다.
+      if (gesture.openRelease) {
+        if (pointReleaseStartTime == null) pointReleaseStartTime = nowMs;
+        if (nowMs - pointReleaseStartTime >= POINT_RELEASE_MS) {
+          exitCloneModeSoft();
+          return;
+        }
+      } else {
+        pointReleaseStartTime = null;
+      }
+
+      // 중지/약지/소지가 대부분 접힌 동안 검지 bend를 받는다.
+      if (!gesture.othersFolded) return;
+
+      const straightEnough =
+        gesture.indexStraight >= FLICK_ARM_STRAIGHTNESS ||
+        gesture.indexBendAngle >= FLICK_ARM_ANGLE_DEG;
+
+      const bentEnough =
+        gesture.indexStraight <= FLICK_BEND_STRAIGHTNESS ||
+        gesture.indexBendAngle <= FLICK_BEND_ANGLE_DEG;
+
+      // 검지를 다시 편 상태가 확인되면 다음 까딱임을 arm.
+      if (!flickArmed) {
+        if (straightEnough && nowMs - lastFlickTime >= FLICK_REARM_MS) {
+          flickArmed = true;
+          bentHoldStartTime = null;
+        }
+        return;
+      }
+
+      // arm된 상태에서 검지를 충분히 굽히면 즉시 FIX + 다음 follower 생성.
+      if (bentEnough && nowMs - lastFlickTime >= FLICK_REARM_MS) {
+        flickArmed = false;
+        bentHoldStartTime = nowMs;
+        lastFlickTime = nowMs;
+        lockAndClone(nowMs);
+      }
+    }
+
+    // ============================================================
+    // 8. 박수 감지 / 전체 해체 ↔ 복원
+    // ============================================================
+    function clearCloneStateWhileBlack() {
+      if (clapCleanupDone) return;
+      clapCleanupDone = true;
+      clapCleanupPending = false;
+
+      // 화면이 완전히 검게 된 뒤 복제 구조를 정리한다.
+      // 따라서 사라지는 순간까지는 현재 보이던 모든 구체와 브리지가 함께 해체된다.
+      const extraSpheres = new Set([...lockedSpheres, activeSphere, ...dissolvingSpheres]);
+      extraSpheres.delete(baseSphere);
+      extraSpheres.forEach((sphere) => sphere?.dispose());
+
+      bridges.forEach((bridge) => bridge.dispose());
+      dissolvingBridges.forEach((bridge) => bridge.dispose());
+      bridges.length = 0;
+      dissolvingBridges.length = 0;
+      dissolvingSpheres.length = 0;
+      lockedSpheres.length = 0;
+
+      cloneMode = false;
+      resetSplitState(true);
+      pointStartTime = null;
+      pointReleaseStartTime = null;
+      bentHoldStartTime = null;
+      flickArmed = false;
+
+      activeSphere = baseSphere;
+      baseSphere.locked = false;
+      baseSphere.lockPosition = null;
+      baseSphere.emerging = false;
+      baseSphere.sourceSphere = null;
+      baseSphere.dissolving = false;
+      baseSphere.life = 1;
+      baseSphere.targetLife = 1;
+      baseSphere.targetPos.set(0, 0, 0);
+      baseSphere.targetRadius = 1.03;
+      baseSphere.targetSpread = 0.075;
+      baseSphere.targetQuaternion.identity();
+
+      rotationReferenceReady = false;
+      modeEl.textContent = "NORMAL · 검지 포인팅으로 CLONE MODE";
+      resetFastChargeState();
+    }
+
+    function toggleClapState(nowMs) {
+      if (nowMs - lastClapTime < CLAP_COOLDOWN_MS) return;
+      lastClapTime = nowMs;
+
+      if (!clapBlack) {
+        // 첫 박수: 현재 보이는 모든 구체/연결부를 그대로 입자화한 뒤 사라지게 한다.
+        resetFastChargeState();
+        clapBlack = true;
+        clapDissolveTarget = 1;
+        clapCleanupPending = true;
+        clapCleanupDone = false;
+        modeEl.textContent = "CLAP · DISSOLVING";
+        statusEl.textContent = "박수 감지 · 구체가 점으로 해체됩니다";
+        statusEl.classList.remove("hide");
+        playDissolveWhoosh();
+        setAmbientTargetGain(AMBIENT_TRANSITION_GAIN * 0.6, 0.18);
+        setTimeout(() => document.body.classList.add("clap-black"), 480);
+      } else {
+        // 두 번째 박수: 검은 화면 속 점들이 다시 모이면서 새로운 랜덤 구체로 복원된다.
+        if (clapCleanupPending && !clapCleanupDone) {
+          clearCloneStateWhileBlack();
+        }
+        const nextStyle = pickRandomSphereStyle(currentSphereStyle);
+        setCurrentSphereStyle(nextStyle, {
+          applyToBaseSphere: true,
+          seedScattered: true
+        });
+
+        clapBlack = false;
+        clapDissolveTarget = 0;
+        document.body.classList.remove("clap-black");
+        modeEl.textContent = `RESTORING · ${currentSphereStyle.name}`;
+        statusEl.textContent = `박수 감지 · ${currentSphereStyle.name} 구체가 다시 모입니다`;
+        statusEl.classList.remove("hide");
+        playRestoreWhoosh();
+        setAmbientTargetGain(AMBIENT_TRANSITION_GAIN * 0.75, 0.18);
+        setTimeout(() => statusEl.classList.add("hide"), 1800);
+      }
+    }
+
+    function updateAudioClapDetection(nowMs) {
+      if (!microphoneReady || !audioAnalyser || !audioTimeData || !audioFreqData) return false;
+      if (audioContext?.state === "suspended") return false;
+      // 방금 재생한 복제 완료음의 잔향을 박수로 잘못 인식하지 않는다.
+      if (nowMs < audioClapIgnoreUntil) {
+        clapCandidateAt = -Infinity;
+        clapCandidateRms = 0;
+        return false;
+      }
+
+      audioAnalyser.getFloatTimeDomainData(audioTimeData);
+      audioAnalyser.getByteFrequencyData(audioFreqData);
+
+      let sumSq = 0;
+      let peak = 0;
+      for (let i = 0; i < audioTimeData.length; i++) {
+        const v = audioTimeData[i];
+        sumSq += v * v;
+        peak = Math.max(peak, Math.abs(v));
+      }
+      const rms = Math.sqrt(sumSq / audioTimeData.length);
+      const onset = rms - previousAudioRms;
+      previousAudioRms = rms;
+      const crest = peak / Math.max(0.0001, rms);
+
+      // 박수는 보통 비교적 넓은 주파수 대역을 포함한다.
+      const nyquist = audioContext.sampleRate * 0.5;
+      const binHz = nyquist / audioFreqData.length;
+      const highStart = Math.max(1, Math.floor(1800 / binHz));
+      let allEnergy = 0;
+      let highEnergy = 0;
+      for (let i = 1; i < audioFreqData.length; i++) {
+        const e = audioFreqData[i] / 255;
+        const ee = e * e;
+        allEnergy += ee;
+        if (i >= highStart) highEnergy += ee;
+      }
+      const highRatio = highEnergy / Math.max(0.0001, allEnergy);
+
+      // 큰 transient가 아닐 때만 주변 소음 기준치를 천천히 갱신한다.
+      if (rms < Math.max(CLAP_MIN_RMS * 1.35, audioNoiseFloor * 2.1)) {
+        audioNoiseFloor = lerp(audioNoiseFloor, rms, CLAP_NOISE_ADAPT);
+      }
+
+      const dynamicThreshold = Math.max(CLAP_MIN_RMS, audioNoiseFloor * CLAP_NOISE_MULTIPLIER);
+      const clapOnsetLike =
+        rms >= dynamicThreshold &&
+        peak >= CLAP_MIN_PEAK &&
+        onset >= CLAP_MIN_ONSET &&
+        crest >= CLAP_MIN_CREST &&
+        highRatio >= CLAP_MIN_HIGH_RATIO &&
+        nowMs - lastClapTime >= CLAP_COOLDOWN_MS;
+
+      // 1) 강한 onset을 후보로 저장
+      if (clapOnsetLike && !Number.isFinite(clapCandidateAt)) {
+        clapCandidateAt = nowMs;
+        clapCandidateRms = rms;
+        return false;
+      }
+
+      // 2) 실제 박수라면 30~200ms 안에 음량이 빠르게 꺼진다.
+      //    말소리/음악/문 닫힘처럼 길게 이어지는 소리는 여기서 걸러진다.
+      if (Number.isFinite(clapCandidateAt)) {
+        const age = nowMs - clapCandidateAt;
+        const decayFloor = Math.max(audioNoiseFloor * 2.4, clapCandidateRms * CLAP_DECAY_RATIO);
+
+        if (age >= CLAP_CONFIRM_MIN_MS && age <= CLAP_CONFIRM_MAX_MS && rms <= decayFloor) {
+          clapCandidateAt = -Infinity;
+          clapCandidateRms = 0;
+          toggleClapState(nowMs);
+          micStatusEl.textContent = "MIC · CLAP";
+          setTimeout(() => {
+            if (microphoneReady) micStatusEl.textContent = "MIC · LISTENING";
+          }, 500);
+          return true;
+        }
+
+        if (age > CLAP_CONFIRM_MAX_MS) {
+          clapCandidateAt = -Infinity;
+          clapCandidateRms = 0;
+        }
+      }
+      return false;
+    }
+
+    async function startMicrophone(audioStream) {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) throw new Error("이 브라우저는 Web Audio API를 지원하지 않습니다.");
+
+      microphoneStream = audioStream;
+      audioContext = new AudioCtx();
+      audioAnalyser = audioContext.createAnalyser();
+      audioAnalyser.fftSize = 1024;
+      audioAnalyser.smoothingTimeConstant = 0.05;
+      audioAnalyser.minDecibels = -90;
+      audioAnalyser.maxDecibels = -10;
+
+      microphoneSource = audioContext.createMediaStreamSource(audioStream);
+      microphoneSource.connect(audioAnalyser);
+      audioTimeData = new Float32Array(audioAnalyser.fftSize);
+      audioFreqData = new Uint8Array(audioAnalyser.frequencyBinCount);
+      ensureCloneChimeGraph();
+      ensureMainReverbGraph();
+      ensureAmbientGraph();
+      ensureFastChargeGraph();
+
+      // Chrome/Safari의 autoplay 정책 때문에 처음에는 suspended일 수 있다.
+      // 첫 클릭/터치에서 자동으로 resume한다.
+      const resumeAudio = async () => {
+        if (audioContext?.state === "suspended") {
+          try { await audioContext.resume(); } catch (_) {}
+        }
+        if (audioContext?.state === "running") {
+          microphoneReady = true;
+          micStatusEl.textContent = "MIC · LISTENING";
+          startAmbientBed();
+          setAmbientTargetGain(clapBlack ? AMBIENT_BLACK_GAIN : AMBIENT_MASTER_GAIN, 1.1);
+          window.removeEventListener("pointerdown", resumeAudio);
+          window.removeEventListener("keydown", resumeAudio);
+        }
+      };
+
+      await resumeAudio();
+      if (audioContext.state !== "running") {
+        micStatusEl.textContent = "MIC · 화면을 한 번 클릭";
+        window.addEventListener("pointerdown", resumeAudio);
+        window.addEventListener("keydown", resumeAudio);
+      } else {
+        microphoneReady = true;
+        micStatusEl.textContent = "MIC · LISTENING";
+        startAmbientBed();
+        setAmbientTargetGain(clapBlack ? AMBIENT_BLACK_GAIN : AMBIENT_MASTER_GAIN, 1.1);
+      }
+    }
+
+    // ============================================================
+    // 9. MediaPipe
+    // ============================================================
+    let handLandmarker = null;
+    let lastDetectAt = -Infinity;
+    let lastVideoTime = -1;
+    let lastOpenness = 0.55;
+
+    async function createHandLandmarker() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+
+      const options = {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2,
+        minHandDetectionConfidence: 0.55,
+        minHandPresenceConfidence: 0.55,
+        minTrackingConfidence: 0.5
+      };
+
+      try {
+        return await HandLandmarker.createFromOptions(vision, options);
+      } catch (gpuError) {
+        console.warn("GPU delegate failed. Falling back to CPU.", gpuError);
+        options.baseOptions.delegate = "CPU";
+        return await HandLandmarker.createFromOptions(vision, options);
+      }
+    }
+
+    async function startCameraAndMicrophone() {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error("이 브라우저는 카메라/마이크 API를 지원하지 않습니다.");
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      });
+
+      const videoTracks = stream.getVideoTracks();
+      const audioTracks = stream.getAudioTracks();
+
+      const videoOnlyStream = new MediaStream(videoTracks);
+      video.srcObject = videoOnlyStream;
+      await video.play();
+
+      if (audioTracks.length) {
+        const audioOnlyStream = new MediaStream(audioTracks);
+        await startMicrophone(audioOnlyStream);
+      } else {
+        micStatusEl.textContent = "MIC · 권한 필요";
+      }
+    }
+
+    async function initHandTracking() {
+      statusEl.textContent = "카메라와 마이크 권한을 허용해주세요";
+      await startCameraAndMicrophone();
+      statusEl.textContent = "손 인식 모델을 준비하는 중...";
+      handLandmarker = await createHandLandmarker();
+      statusEl.textContent = `${currentSphereStyle.name} · 포인팅 = 복제 · 양손 pinch = split · 박수 = 해체/복원`;
+    }
+
+    function processPrimaryHandAnalysis(analysis, nowMs) {
+      lastOpenness = analysis.openness;
+
+      handTarget.copy(analysis.palmScene);
+      updateFastChargeFromMotion(handTarget.x, nowMs);
+
+      // 손바닥 3D 방향 — 손 모양과 상관없이 회전 추적
+      const rawHandQuaternion = getHandOrientationQuaternion(analysis.lm);
+      if (rawHandQuaternion) {
+        if (!hasHandOrientation) {
+          smoothedHandQuaternion.copy(rawHandQuaternion);
+          hasHandOrientation = true;
+          beginRotationReference();
+        } else {
+          smoothedHandQuaternion.slerp(rawHandQuaternion, 0.30);
+        }
+      }
+
+      processCloneGestures(analysis.gesture, nowMs);
+      updateActiveSphereRotation();
+
+      if (!firstHandSeen) {
+        firstHandSeen = true;
+        statusEl.classList.add("hide");
+      }
+    }
+
+    function updateHandTracking(nowMs) {
+      if (!handLandmarker || video.readyState < 2) return;
+      if (nowMs - lastDetectAt < DETECTION_INTERVAL_MS) return;
+      if (video.currentTime === lastVideoTime) return;
+
+      lastDetectAt = nowMs;
+      lastVideoTime = video.currentTime;
+
+      const result = handLandmarker.detectForVideo(video, nowMs);
+      const hands = result.landmarks ?? [];
+      const handednesses = result.handednesses ?? [];
+      const analyses = hands.map((lm, idx) => analyzeHand(
+        lm,
+        handednesses[idx]?.[0]?.displayName || handednesses[idx]?.[0]?.categoryName || ""
+      ));
+      handSeen = analyses.length > 0;
+
+      // 완전 해체 상태/전환 중에는 박수 감지만 유지하고 다른 인터랙션은 잠근다.
+      const clapTransitionActive = clapDissolve > 0.035 || clapDissolveTarget > 0.5;
+      const splitHandled = !clapTransitionActive && updateTwoHandSplitInteraction(analyses, nowMs, clapTransitionActive);
+
+      if (analyses.length && !clapTransitionActive) {
+        lastHandSeenAt = nowMs;
+        if (splitHandled) {
+          pointStartTime = null;
+          hasHandOrientation = false;
+          rotationReferenceReady = false;
+        } else {
+          const primary = analyses[0];
+          processPrimaryHandAnalysis(primary, nowMs);
+        }
+      } else if (!analyses.length) {
+        pointStartTime = null;
+        hasHandOrientation = false;
+        rotationReferenceReady = false;
+        if (!clapTransitionActive) resetSplitState(false);
+        if (!clapTransitionActive && cloneMode && nowMs - lastHandSeenAt >= HAND_LOST_EXIT_MS) {
+          exitCloneModeSoft();
+        }
+      }
+    }
+
+    // ============================================================
+    // 10. 애니메이션
+    // ============================================================
+    function updateScene(t) {
+      updateAmbientState();
+      // 박수 해체/복원 전역 진행도
+      const clapEase = clapDissolveTarget > clapDissolve
+        ? CLAP_DISSOLVE_EASE
+        : CLAP_RESTORE_EASE;
+      clapDissolve = lerp(clapDissolve, clapDissolveTarget, clapEase);
+      if (Math.abs(clapDissolve - clapDissolveTarget) < 0.0008) {
+        clapDissolve = clapDissolveTarget;
+      }
+
+      // 완전히 검게 된 순간에만 복제 상태를 정리한다.
+      if (clapCleanupPending && clapDissolve > 0.985) {
+        clearCloneStateWhileBlack();
+      }
+
+      const clapInteractionLocked = clapDissolve > 0.035 || clapDissolveTarget > 0.5;
+      const interactionLockedForCharge = clapInteractionLocked || splitMode;
+      updateFastChargeState(frameDeltaSec, handSeen, interactionLockedForCharge);
+      updateFastChargeAudio();
+
+      if (handSeen && !clapInteractionLocked && !splitMode) {
+        smoothedHandTarget.lerp(handTarget, 0.13);
+      }
+
+      if (!clapInteractionLocked && splitMode) {
+        activeSphere.targetPos.copy(splitMidpoint);
+        activeSphere.targetRadius = lerp(0.32, 0.14, splitAmount);
+        activeSphere.targetSpread = lerp(0.05, 0.012, splitAmount);
+        activeSphere.targetLife = lerp(1.0, 0.04, splitAmount);
+      } else if (!clapInteractionLocked && !cloneMode) {
+        // 기존 인터랙션: 한 개 구체가 손 위치/펼침 정도를 따름
+        activeSphere.targetLife = 1;
+        if (handSeen) {
+          activeSphere.targetPos.copy(smoothedHandTarget);
+          activeSphere.targetRadius = lerp(0.34, 1.42, lastOpenness) * lerp(1, FAST_CHARGE_SHRINK, fastChargeLevel);
+          activeSphere.targetSpread = lerp(0.018, 0.24, lastOpenness) * lerp(1, FAST_CHARGE_DENSITY_SCALE, fastChargeLevel);
+        } else {
+          activeSphere.targetPos.lerp(new THREE.Vector3(0, 0, 0), 0.03);
+          activeSphere.targetRadius = 1.02;
+          activeSphere.targetSpread = 0.07;
+        }
+      } else if (!clapInteractionLocked) {
+        // 복제 모드: 현재 active sphere만 손을 따라감.
+        // locked sphere는 해당 위치에 고정.
+        if (activeSphere && !activeSphere.locked && handSeen) {
+          activeSphere.targetPos.copy(smoothedHandTarget);
+
+          if (activeSphere.emerging && activeSphere.sourceSphere) {
+            const d = activeSphere.sourceSphere.currentPos.distanceTo(smoothedHandTarget);
+            const emergence = smootherstep(0.035, FOLLOWER_FULL_DISTANCE, d);
+            activeSphere.targetRadius = lerp(0.05, FOLLOWER_RADIUS, emergence) * lerp(1, FAST_CHARGE_SHRINK, fastChargeLevel);
+            activeSphere.targetSpread = lerp(0.28, 0.07, emergence) * lerp(1, FAST_CHARGE_DENSITY_SCALE, fastChargeLevel);
+            activeSphere.targetLife = emergence;
+          } else {
+            activeSphere.targetRadius = FOLLOWER_RADIUS * lerp(1, FAST_CHARGE_SHRINK, fastChargeLevel);
+            activeSphere.targetSpread = 0.07 * lerp(1, FAST_CHARGE_DENSITY_SCALE, fastChargeLevel);
+          }
+        }
+      }
+
+      // 모든 구체 업데이트
+      const sphereSet = new Set([baseSphere, ...lockedSpheres, activeSphere, leftSplitSphere, rightSplitSphere, ...dissolvingSpheres]);
+      sphereSet.forEach((sphere) => sphere?.update(t));
+      updateCoreGlow(t, clapInteractionLocked);
+
+      bridges.forEach((bridge) => bridge.update(t));
+      dissolvingBridges.forEach((bridge) => bridge.update(t));
+
+      // 사라진 브리지 메모리 정리
+      for (let i = dissolvingBridges.length - 1; i >= 0; i--) {
+        const bridge = dissolvingBridges[i];
+        if (bridge.life < 0.025 && bridge.material.opacity < 0.025) {
+          bridge.dispose();
+          dissolvingBridges.splice(i, 1);
+        }
+      }
+
+      // 사라진 구체 메모리 정리
+      for (let i = dissolvingSpheres.length - 1; i >= 0; i--) {
+        const s = dissolvingSpheres[i];
+        if (s.life < 0.025) {
+          s.dispose();
+          dissolvingSpheres.splice(i, 1);
+        }
+      }
+
+      if (!splitMode) {
+        if (leftSplitSphere && leftSplitSphere.life < 0.025) { leftSplitSphere.dispose(); leftSplitSphere = null; }
+        if (rightSplitSphere && rightSplitSphere.life < 0.025) { rightSplitSphere.dispose(); rightSplitSphere = null; }
+      }
+
+      if (!clapBlack && clapDissolveTarget === 0 && clapDissolve < 0.025) {
+        if (splitMode) {
+          modeEl.textContent = "SPLIT MODE · pinch 유지 + 좌우로 늘리기";
+        } else if (fastChargeMode && cloneMode) {
+          modeEl.textContent = "CLONE MODE · FAST CHARGE";
+        } else if (fastChargeMode) {
+          modeEl.textContent = "FAST CHARGE · 좌우 흔들기 감지";
+        } else if (cloneMode) {
+          modeEl.textContent = "CLONE MODE · 까딱 = FIX / 손바닥 펼침 = CLEAR";
+        } else {
+          modeEl.textContent = "NORMAL · 검지 포인팅으로 CLONE MODE";
+        }
+      }
+    }
+
+    let lastAnimateNowMs = performance.now();
+    function animate(nowMs = performance.now()) {
+      requestAnimationFrame(animate);
+      frameDeltaSec = Math.min(0.05, Math.max(0.001, (nowMs - lastAnimateNowMs) / 1000));
+      lastAnimateNowMs = nowMs;
+      updateAudioClapDetection(nowMs);
+      updateHandTracking(nowMs);
+      updateScene(clock.getElapsedTime());
+      renderer.render(scene, camera);
+    }
+
+    // ============================================================
+    // 11. 리사이즈 / 디버그 / 초기화
+    // ============================================================
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    });
+
+    window.addEventListener("keydown", (e) => {
+      const key = e.key.toLowerCase();
+      if (key === "d") video.classList.toggle("debug");
+      if (key === "r") resetScene();
+      // N 키: 박수 없이도 다음 랜덤 구체를 빠르게 테스트한다.
+      if (key === "n") {
+        const nextStyle = pickRandomSphereStyle(currentSphereStyle);
+        setCurrentSphereStyle(nextStyle, { applyToBaseSphere: true, seedScattered: false });
+        resetScene();
+      }
+      // S 키는 복제 완료음만 테스트하기 위한 디버그용 수동 트리거
+      if (key === "s") playCloneChime();
+      // X / V 키는 박수 해체/복원 사운드만 테스트하기 위한 디버그용 수동 트리거
+      if (key === "x") playDissolveWhoosh();
+      if (key === "v") playRestoreWhoosh();
+      // C 키는 박수 전환을 테스트하기 위한 디버그용 수동 트리거
+      if (key === "c") toggleClapState(performance.now());
+    });
+
+    animate();
+
+    initHandTracking().catch((err) => {
+      console.error(err);
+      statusEl.classList.remove("hide");
+      statusEl.textContent =
+        "카메라/마이크를 시작하지 못했습니다. VSCode Live Server(localhost)에서 열고 카메라와 마이크 권한을 확인해주세요.";
+    });
+  </script>
+</body>
+</html>
